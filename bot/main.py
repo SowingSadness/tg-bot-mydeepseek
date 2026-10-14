@@ -48,7 +48,20 @@ async def main() -> None:
 
     await _set_commands(bot)
     await bot.delete_webhook(drop_pending_updates=True)
-    log.info("Бот запущен как @%s (модель %s)", settings.bot_username, settings.deepseek_model)
+
+    me = await bot.get_me()
+    if (me.username or "").lower() != settings.bot_username.lower():
+        log.warning(
+            "BOT_USERNAME=%s не совпадает с реальным @%s — упоминания в группах и inline-режим могут не работать.",
+            settings.bot_username,
+            me.username,
+        )
+    log.info(
+        "Бот @%s запущен (модель %s, BOT_USERNAME=%s)",
+        me.username,
+        settings.deepseek_model,
+        settings.bot_username,
+    )
 
     try:
         await dispatcher.start_polling(bot)

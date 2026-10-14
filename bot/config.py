@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from pydantic import field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -15,15 +16,24 @@ class Settings(BaseSettings):
 
     telegram_bot_token: str
     deepseek_api_key: str
+    bot_username: str
 
     deepseek_base_url: str = "https://api.deepseek.com"
     deepseek_model: str = "deepseek-flash"
-    bot_username: str = "sowing_bot"
     request_timeout: float = 180.0
     log_level: str = "INFO"
 
     # Список ID через запятую. Пусто = доступ открыт всем.
     allowed_user_ids: str = ""
+
+    @field_validator("bot_username")
+    @classmethod
+    def _normalize_username(cls, value: str) -> str:
+        """Принимает `@name` или `name`, возвращает `name`."""
+        value = value.strip().lstrip("@").strip()
+        if not value:
+            raise ValueError("BOT_USERNAME не может быть пустым")
+        return value
 
     @property
     def allowed_ids(self) -> set[int]:

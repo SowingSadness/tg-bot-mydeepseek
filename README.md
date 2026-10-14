@@ -29,12 +29,12 @@
 3. Разрешите добавление в группы: `/setjoingroups` → **Enable**.
 4. По желанию: `/setinlinefeedback` → статистика использования inline-режима.
 
-> Юзернейм бота должен совпадать со значением `BOT_USERNAME` в `.env` — по нему бот понимает, когда его упомянули в группе.
+> Юзернейм бота должен совпадать со значением `BOT_USERNAME` в `.env` — по нему бот понимает, когда его упомянули в группе. Значение `BOT_USERNAME` задаётся при развороте и обязательно к заполнению; можно писать как `name`, так и `@name`.
 
 ## Быстрый старт (локально)
 
 ```bash
-git clone git@github.com:<user>/tg-bot-mydeepseek.git
+git clone git@github.com:SowingSadness/tg-bot-mydeepseek.git
 cd tg-bot-mydeepseek
 
 python -m venv .venv
@@ -46,7 +46,7 @@ source .venv/bin/activate
 pip install -r requirements.txt
 
 cp .env.example .env      # Windows: copy .env.example .env
-# откройте .env и впишите TELEGRAM_BOT_TOKEN и DEEPSEEK_API_KEY
+# откройте .env и впишите TELEGRAM_BOT_TOKEN, DEEPSEEK_API_KEY и BOT_USERNAME
 
 python -m bot.main
 ```
@@ -59,7 +59,7 @@ python -m bot.main
 | `DEEPSEEK_API_KEY` | да | — | Ключ DeepSeek API |
 | `DEEPSEEK_BASE_URL` | нет | `https://api.deepseek.com` | Базовый URL API |
 | `DEEPSEEK_MODEL` | нет | `deepseek-flash` | Модель. Картинки умеет только `deepseek-flash` |
-| `BOT_USERNAME` | нет | `sowing_bot` | Юзернейм без `@`, для упоминаний в группах |
+| `BOT_USERNAME` | **да** | — | Имя бота без `@` (например `sowing_tg_bot`), задаётся при развороте |
 | `ALLOWED_USER_IDS` | нет | пусто | ID пользователей через запятую. Пусто = доступ открыт всем |
 | `REQUEST_TIMEOUT` | нет | `180` | Таймаут запроса к DeepSeek, секунды |
 | `LOG_LEVEL` | нет | `INFO` | Уровень логирования |
@@ -77,10 +77,10 @@ sudo usermod -aG docker "$USER"   # затем перелогиниться
 
 # 2. Забрать проект и настроить окружение
 sudo mkdir -p /opt/tg-bot-mydeepseek && sudo chown "$USER" /opt/tg-bot-mydeepseek
-git clone git@github.com:<user>/tg-bot-mydeepseek.git /opt/tg-bot-mydeepseek
+git clone git@github.com:SowingSadness/tg-bot-mydeepseek.git /opt/tg-bot-mydeepseek
 cd /opt/tg-bot-mydeepseek
 cp .env.example .env
-nano .env                          # вписать токен и ключ
+nano .env                          # TOKEN, DEEPSEEK_API_KEY, BOT_USERNAME, ALLOWED_USER_IDS
 
 # 3. Запустить
 docker compose up -d --build
@@ -103,7 +103,7 @@ docker compose up -d --build
 sudo useradd --system --create-home --shell /usr/sbin/nologin bot
 sudo mkdir -p /opt/tg-bot-mydeepseek && sudo chown bot:bot /opt/tg-bot-mydeepseek
 
-sudo -u bot git clone git@github.com:<user>/tg-bot-mydeepseek.git /opt/tg-bot-mydeepseek
+sudo -u bot git clone git@github.com:SowingSadness/tg-bot-mydeepseek.git /opt/tg-bot-mydeepseek
 cd /opt/tg-bot-mydeepseek
 sudo -u bot python3 -m venv .venv
 sudo -u bot .venv/bin/pip install -r requirements.txt
