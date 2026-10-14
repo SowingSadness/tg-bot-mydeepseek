@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 from typing import Sequence
 
-from openai import APIError, APIStatusError, APITimeoutError, AsyncOpenAI
+from openai import NOT_GIVEN, APIError, APIStatusError, APITimeoutError, AsyncOpenAI
 
 from .config import settings
 
@@ -66,7 +66,7 @@ class DeepSeekClient:
                 model=self._model,
                 messages=messages,
                 extra_body=extra_body,
-                max_tokens=max_tokens,
+                max_tokens=max_tokens if max_tokens is not None else NOT_GIVEN,
             )
         except APITimeoutError as exc:
             raise DeepSeekError("DeepSeek не ответил вовремя. Попробуйте ещё раз.") from exc

@@ -23,6 +23,12 @@ class Settings(BaseSettings):
     request_timeout: float = 180.0
     log_level: str = "INFO"
 
+    # Настройки inline-режима (Telegram даёт на ответ ~10 секунд).
+    inline_timeout: float = 8.5
+    inline_max_tokens: int = 350
+    inline_cache_ttl: int = 300
+    warmup_on_start: bool = True
+
     # Список ID через запятую. Пусто = доступ открыт всем.
     allowed_user_ids: str = ""
 

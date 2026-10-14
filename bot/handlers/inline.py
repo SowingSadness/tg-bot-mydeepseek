@@ -1,12 +1,15 @@
 """Inline-режим: @username запрос в любом чате.
 
 Telegram ждёт результат inline-запроса около 10 секунд, после чего query ID
-протухает. DeepSeek отвечает медленнее, поэтому здесь:
+протухает (``QUERY_ID_INVALID``). DeepSeek отвечает медленнее, поэтому здесь:
 
 * длина ответа ограничена (``INLINE_MAX_TOKENS``) — короче значит быстрее;
-* действует жёсткий дедлайн (``INLINE_TIMEOUT``) с понятной подсказкой при промахе;
+* действует жёсткий дедлайн (``INLINE_TIMEOUT``) с понятной подсказкой;
 * устаревшие запросы отменяются — обрабатывается только последний от пользователя;
 * режим рассуждений принудительно выключен (с ним успеть невозможно);
+* ответы кэшируются в памяти (``INLINE_CACHE_TTL``), плюс их кэширует сам Telegram;
+* слишком короткие запросы не тратят квоту DeepSeek;
+* в выдаче минимум результатов, чтобы клиенту было что отрисовать быстрее;
 * ошибки не засоряют лог трейсбеками.
 """
 
@@ -15,6 +18,8 @@ from __future__ import annotations
 import asyncio
 import html
 import logging
+import time
+from collections import OrderedDict
 from typing import Any
 
 from aiogram import Router
@@ -24,6 +29,7 @@ from aiogram.types import (
     InlineQuery,
     InlineQueryResultArticle,
     InlineQueryResultPhoto,
+    InlineQueryResultsButton,
     InputTextMessageContent,
 )
 
@@ -36,22 +42,56 @@ log = logging.getLogger(__name__)
 
 router = Router(name="inline")
 
-MAX_PHOTO_RESULTS = 10
+# Каждая картинка в выдаче заставляет Telegram скачивать превью, поэтому список
+# держим коротким — так результаты появляются быстрее.
+MAX_PHOTO_RESULTS = 4
 
-# Жёсткий дедлайн на весь запрос. Лимит Telegram — около 10 с; 8.5 с оставляет
-# запас на сетевой round-trip к Telegram при отправке ответа.
-INLINE_TIMEOUT = 8.5
-
-# Короткие ответы генерируются быстрее и лучше смотрятся в подсказке inline.
-INLINE_MAX_TOKENS = 350
+# Короче этого запрос в DeepSeek не отправляем — отвечаем подсказкой.
+MIN_QUERY_LEN = 3
 
 INLINE_SYSTEM = (
     "Отвечай кратко и по делу: только суть, без вступлений и длинных пояснений. "
     "Если уместен список — используй короткие пункты. Не предлагай и не вставляй изображения."
 )
 
+_OPEN_CHAT_BUTTON = InlineQueryResultsButton(
+    text="💬 Открыть чат с ботом",
+    start_parameter="inline",
+)
+
+# Кэш ответов в памяти: ключ — (пользователь, нормализованный запрос).
+# Персональный ключ нужен, чтобы результаты не «протекали» между пользователями
+# мимо allowlist.
+_CACHE_MAX = 256
+_cache: OrderedDict[tuple[int, str], tuple[float, str]] = OrderedDict()
+
 # Последний незавершённый запрос каждого пользователя (для отмены устаревших).
 _inflight: dict[int, asyncio.Task] = {}
+
+
+def _cache_key(user_id: int, text: str) -> tuple[int, str]:
+    return user_id, " ".join(text.lower().split())
+
+
+def _cache_get(user_id: int, text: str) -> str | None:
+    key = _cache_key(user_id, text)
+    item = _cache.get(key)
+    if item is None:
+        return None
+    stored_at, answer = item
+    if time.monotonic() - stored_at > settings.inline_cache_ttl:
+        _cache.pop(key, None)
+        return None
+    _cache.move_to_end(key)
+    return answer
+
+
+def _cache_put(user_id: int, text: str, answer: str) -> None:
+    key = _cache_key(user_id, text)
+    _cache[key] = (time.monotonic(), answer)
+    _cache.move_to_end(key)
+    while len(_cache) > _CACHE_MAX:
+        _cache.popitem(last=False)
 
 
 def _hint(title: str, description: str) -> list[InlineQueryResultArticle]:
@@ -78,30 +118,36 @@ async def _answer(query: InlineQuery, results: list, **kwargs: Any) -> None:
 
 async def _process(query: InlineQuery, text: str) -> None:
     """Считает ответ в DeepSeek в рамках дедлайна и отдаёт его Telegram."""
-    try:
-        answer = await asyncio.wait_for(
-            deepseek.ask(
-                text,
-                images=extract_image_urls(text, limit=5) or None,
-                thinking=False,
-                max_tokens=INLINE_MAX_TOKENS,
-                system=INLINE_SYSTEM,
-            ),
-            timeout=INLINE_TIMEOUT,
-        )
-    except asyncio.TimeoutError:
-        await _answer(
-            query,
-            _hint(
-                "⏳ Не успеваю за лимит inline",
-                f"Запрос считается дольше {INLINE_TIMEOUT:g} с. "
-                f"Напишите боту в личный чат — @{settings.bot_username} — там отвечу без спешки.",
-            ),
-        )
-        return
-    except DeepSeekError as exc:
-        await _answer(query, _hint("⚠️ Ошибка", str(exc)[:200]))
-        return
+    user_id = query.from_user.id
+    answer = _cache_get(user_id, text)
+
+    if answer is None:
+        try:
+            answer = await asyncio.wait_for(
+                deepseek.ask(
+                    text,
+                    images=extract_image_urls(text, limit=5) or None,
+                    thinking=False,
+                    max_tokens=settings.inline_max_tokens,
+                    system=INLINE_SYSTEM,
+                ),
+                timeout=settings.inline_timeout,
+            )
+        except asyncio.TimeoutError:
+            await _answer(
+                query,
+                _hint(
+                    "⏳ Не успеваю за лимит inline",
+                    f"Запрос считается дольше {settings.inline_timeout:g} с. "
+                    f"Откройте чат с ботом — @{settings.bot_username} — там отвечу без спешки.",
+                ),
+                button=_OPEN_CHAT_BUTTON,
+            )
+            return
+        except DeepSeekError as exc:
+            await _answer(query, _hint("⚠️ Ошибка", str(exc)[:200]))
+            return
+        _cache_put(user_id, text, answer)
 
     first_chunk = split_message(answer)[0] if answer else ""
     message_text, parse_mode = telegram_html(first_chunk)
@@ -134,7 +180,9 @@ async def _process(query: InlineQuery, text: str) -> None:
             )
         )
 
-    await _answer(query, results, cache_time=30)
+    # cache_time позволяет Telegram отдать тот же запрос из своего кэша,
+    # не дёргая бота и DeepSeek вообще.
+    await _answer(query, results, cache_time=settings.inline_cache_ttl)
 
 
 @router.inline_query()
@@ -154,6 +202,13 @@ async def on_inline_query(query: InlineQuery) -> None:
                 "Введите запрос",
                 f"Например: @{settings.bot_username} объясни, что такое обратная матрица",
             ),
+        )
+        return
+
+    if len(text) < MIN_QUERY_LEN:
+        await _answer(
+            query,
+            _hint("Продолжайте писать…", f"Введите минимум {MIN_QUERY_LEN} символа."),
         )
         return
 

@@ -10,9 +10,19 @@ from aiogram.client.default import DefaultBotProperties
 from aiogram.types import BotCommand
 
 from .config import settings
+from .deepseek import deepseek
 from .handlers import group, inline, private
 
 log = logging.getLogger(__name__)
+
+
+async def _warmup() -> None:
+    """Прогревает TLS-соединение с DeepSeek, чтобы первый inline-запрос был быстрее."""
+    try:
+        await deepseek.ask("ok", max_tokens=1)
+        log.info("Соединение с DeepSeek прогрето")
+    except Exception:  # noqa: BLE001
+        log.debug("Прогрев соединения с DeepSeek не удался", exc_info=True)
 
 
 async def _set_commands(bot: Bot) -> None:
@@ -62,6 +72,10 @@ async def main() -> None:
         settings.deepseek_model,
         settings.bot_username,
     )
+
+    if settings.warmup_on_start:
+        # Не ждём прогрева: он нужен только для скорости первого запроса.
+        asyncio.create_task(_warmup())
 
     try:
         await dispatcher.start_polling(bot)
