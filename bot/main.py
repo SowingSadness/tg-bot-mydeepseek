@@ -41,6 +41,11 @@ async def main() -> None:
     dispatcher.include_router(private.router)
     dispatcher.include_router(group.router)
 
+    @dispatcher.callback_query()
+    async def _answer_any_callback(callback) -> None:  # noqa: ANN001
+        """Чтобы кнопки не «зависали» со спиннером вне личного чата."""
+        await callback.answer()
+
     await _set_commands(bot)
     await bot.delete_webhook(drop_pending_updates=True)
     log.info("Бот запущен как @%s (модель %s)", settings.bot_username, settings.deepseek_model)

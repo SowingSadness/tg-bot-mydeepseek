@@ -5,14 +5,14 @@ from __future__ import annotations
 import logging
 from io import BytesIO
 
-from aiogram.enums import ChatAction, ParseMode
+from aiogram.enums import ChatAction
 from aiogram.exceptions import TelegramBadRequest
 from aiogram.types import Message
 
 from .config import settings
 from .deepseek import DeepSeekError, deepseek
 from .state import is_thinking
-from .utils import extract_image_urls, markdown_to_html, split_message
+from .utils import extract_image_urls, split_message, telegram_html
 
 log = logging.getLogger(__name__)
 
@@ -55,15 +55,14 @@ async def ask_and_reply(
 
     chunks = split_message(answer)
     for index, chunk in enumerate(chunks):
-        reply_to = message.message_id if index == 0 else None
+        content, parse_mode = telegram_html(chunk)
+        extra: dict = {}
+        if index == 0:
+            extra["reply_to_message_id"] = message.message_id
         try:
-            await message.answer(
-                markdown_to_html(chunk),
-                parse_mode=ParseMode.HTML,
-                reply_to_message_id=reply_to,
-            )
+            await message.answer(content, parse_mode=parse_mode, **extra)
         except TelegramBadRequest:
-            await message.answer(chunk, parse_mode=None, reply_to_message_id=reply_to)
+            await message.answer(chunk, parse_mode=None, **extra)
 
     for url in extract_image_urls(answer, limit=CHAT_IMAGE_PREVIEWS):
         try:

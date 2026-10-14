@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import html
 import logging
 
 from aiogram import Router
@@ -17,13 +18,12 @@ from ..config import settings
 from ..deepseek import DeepSeekError, deepseek
 from ..respond import is_allowed
 from ..state import is_thinking
-from ..utils import extract_image_urls, markdown_to_html, split_message
+from ..utils import extract_image_urls, split_message, telegram_html
 
 log = logging.getLogger(__name__)
 
 router = Router(name="inline")
 
-ANSWER_LIMIT = 4096
 MAX_PHOTO_RESULTS = 10
 
 
@@ -75,21 +75,23 @@ async def on_inline_query(query: InlineQuery) -> None:
         return
 
     first_chunk = split_message(answer)[0] if answer else ""
-    preview = markdown_to_html(first_chunk)
+    message_text, parse_mode = telegram_html(first_chunk)
+    title = (answer.splitlines()[0].strip() if answer else "")[:64] or "Ответ DeepSeek"
+    description = " ".join(answer.split())[:128]
 
     results: list = [
         InlineQueryResultArticle(
             id="answer",
-            title=answer.splitlines()[0][:80] or "Ответ DeepSeek",
-            description=" ".join(answer.split())[:120],
+            title=title,
+            description=description,
             input_message_content=InputTextMessageContent(
-                message_text=preview[:ANSWER_LIMIT],
-                parse_mode=ParseMode.HTML,
+                message_text=message_text,
+                parse_mode=parse_mode,
             ),
         )
     ]
 
-    caption = " ".join(answer.split())[:900]
+    caption = html.escape(" ".join(answer.split())[:900])
     for index, url in enumerate(extract_image_urls(answer, limit=MAX_PHOTO_RESULTS)):
         results.append(
             InlineQueryResultPhoto(
@@ -97,7 +99,7 @@ async def on_inline_query(query: InlineQuery) -> None:
                 photo_url=url,
                 thumbnail_url=url,
                 title="🖼 Картинка из ответа",
-                description=url,
+                description=url[:128],
                 caption=caption or None,
                 parse_mode=ParseMode.HTML,
             )

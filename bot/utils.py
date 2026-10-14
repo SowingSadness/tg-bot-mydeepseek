@@ -68,6 +68,14 @@ def markdown_to_html(text: str) -> str:
     return text
 
 
+def telegram_html(text: str, limit: int = TELEGRAM_LIMIT) -> tuple[str, str | None]:
+    """Готовит текст для Telegram: HTML, если он влезает в лимит, иначе чистый текст."""
+    html_text = markdown_to_html(text)
+    if len(html_text) <= limit:
+        return html_text, "HTML"
+    return text[:limit], None
+
+
 def split_message(text: str, limit: int = TELEGRAM_LIMIT) -> list[str]:
     """Разбивает текст на части, не превышающие лимит Telegram."""
     text = text.strip()
