@@ -1,0 +1,153 @@
+# tg-bot-mydeepseek
+
+Телеграм-бот на **DeepSeek API** (модель `deepseek-flash`). Работает в двух режимах:
+
+- **Inline** — в любом чате наберите `@username ваш запрос`, бот вернёт ответ, который можно отправить в чат. Если в ответе есть ссылки на изображения, они показываются галереей — тапните, чтобы вставить картинку (по аналогии с `@pic`).
+- **Личные сообщения и группы** — обычный диалог с ботом. Пришлите **фото** (или фото с подписью-вопросом, или ответьте на фото) — бот разберёт изображение. Ссылку на картинку можно указать и прямо в тексте запроса.
+
+Контекст диалога не сохраняется: каждый запрос независим. Режим рассуждений выключен по умолчанию и включается командой `/think`.
+
+## Команды
+
+| Команда | Действие |
+| --- | --- |
+| `/start` | Приветствие |
+| `/help` | Справка |
+| `/think` | Включить/выключить режим рассуждений (для сложных задач) |
+| `/reset` | Сбросить настройки |
+
+## Требования
+
+- Python 3.11+ (или Docker)
+- Токен бота от [@BotFather](https://t.me/BotFather)
+- Ключ DeepSeek API с [platform.deepseek.com](https://platform.deepseek.com) с положительным балансом
+
+### Настройка бота в @BotFather
+
+1. Создайте бота и получите токен: `/newbot`.
+2. Включите inline-режим (обязательно!): `/setinline` → укажите подсказку, например `Поиск ответа…`.
+3. Разрешите добавление в группы: `/setjoingroups` → **Enable**.
+4. По желанию: `/setinlinefeedback` → статистика использования inline-режима.
+
+> Юзернейм бота должен совпадать со значением `BOT_USERNAME` в `.env` — по нему бот понимает, когда его упомянули в группе.
+
+## Быстрый старт (локально)
+
+```bash
+git clone git@github.com:<user>/tg-bot-mydeepseek.git
+cd tg-bot-mydeepseek
+
+python -m venv .venv
+# Linux/macOS:
+source .venv/bin/activate
+# Windows (PowerShell):
+.venv\Scripts\Activate.ps1
+
+pip install -r requirements.txt
+
+cp .env.example .env      # Windows: copy .env.example .env
+# откройте .env и впишите TELEGRAM_BOT_TOKEN и DEEPSEEK_API_KEY
+
+python -m bot.main
+```
+
+## Настройки (`.env`)
+
+| Переменная | Обязательна | По умолчанию | Описание |
+| --- | --- | --- | --- |
+| `TELEGRAM_BOT_TOKEN` | да | — | Токен от @BotFather |
+| `DEEPSEEK_API_KEY` | да | — | Ключ DeepSeek API |
+| `DEEPSEEK_BASE_URL` | нет | `https://api.deepseek.com` | Базовый URL API |
+| `DEEPSEEK_MODEL` | нет | `deepseek-flash` | Модель. Картинки умеет только `deepseek-flash` |
+| `BOT_USERNAME` | нет | `sowing_bot` | Юзернейм без `@`, для упоминаний в группах |
+| `ALLOWED_USER_IDS` | нет | пусто | ID пользователей через запятую. Пусто = доступ открыт всем |
+| `REQUEST_TIMEOUT` | нет | `180` | Таймаут запроса к DeepSeek, секунды |
+| `LOG_LEVEL` | нет | `INFO` | Уровень логирования |
+
+### Как узнать свой Telegram ID
+
+Напишите боту [@userinfobot](https://t.me/userinfobot) — он пришлёт ваш ID. Рекомендуется заполнить `ALLOWED_USER_IDS`, чтобы ботом не пользовались посторонние за ваш счёт.
+
+## Деплой на VPS (Debian, через Docker)
+
+```bash
+# 1. Установить Docker (если ещё нет)
+curl -fsSL https://get.docker.com | sh
+sudo usermod -aG docker "$USER"   # затем перелогиниться
+
+# 2. Забрать проект и настроить окружение
+sudo mkdir -p /opt/tg-bot-mydeepseek && sudo chown "$USER" /opt/tg-bot-mydeepseek
+git clone git@github.com:<user>/tg-bot-mydeepseek.git /opt/tg-bot-mydeepseek
+cd /opt/tg-bot-mydeepseek
+cp .env.example .env
+nano .env                          # вписать токен и ключ
+
+# 3. Запустить
+docker compose up -d --build
+
+# 4. Проверить
+docker compose logs -f
+```
+
+Обновление после `git pull`:
+
+```bash
+cd /opt/tg-bot-mydeepseek
+git pull
+docker compose up -d --build
+```
+
+## Деплой без Docker (systemd)
+
+```bash
+sudo useradd --system --create-home --shell /usr/sbin/nologin bot
+sudo mkdir -p /opt/tg-bot-mydeepseek && sudo chown bot:bot /opt/tg-bot-mydeepseek
+
+sudo -u bot git clone git@github.com:<user>/tg-bot-mydeepseek.git /opt/tg-bot-mydeepseek
+cd /opt/tg-bot-mydeepseek
+sudo -u bot python3 -m venv .venv
+sudo -u bot .venv/bin/pip install -r requirements.txt
+
+sudo -u bot cp .env.example .env
+sudo -u bot nano .env
+
+sudo cp deploy/bot.service /etc/systemd/system/tg-bot-mydeepseek.service
+sudo systemctl daemon-reload
+sudo systemctl enable --now tg-bot-mydeepseek
+sudo journalctl -u tg-bot-mydeepseek -f
+```
+
+## Структура проекта
+
+```
+bot/
+├── main.py            # точка входа, роутеры, long polling
+├── config.py          # настройки из .env (pydantic-settings)
+├── deepseek.py        # клиент DeepSeek (текст, картинки, thinking)
+├── respond.py         # общая логика ответов и скачивания фото
+├── keyboards.py       # inline-клавиатура переключателя /think
+├── state.py           # состояние в памяти (режим рассуждений)
+├── utils.py           # Markdown→HTML, ссылки на картинки, разбивка 4096
+└── handlers/
+    ├── private.py     # личные сообщения
+    ├── group.py       # группы (по упоминанию или ответу)
+    └── inline.py      # inline-режим (@username запрос)
+```
+
+## Как это работает
+
+- Запросы идут на OpenAI-совместимый эндпоинт DeepSeek (`/chat/completions`).
+- Изображения передаются как base64 data-URL (скачанные из Telegram фото) или как внешние `http(s)`-ссылки из текста запроса.
+- Режим рассуждений управляется параметром `thinking` (`extra_body`), при включении добавляется `reasoning_effort: high`.
+- Inline-запросы Telegram ограничены 256 символами и не могут нести изображение — для картинок используйте личку или группу.
+- В группах бот отвечает только на упоминание `@username` или на ответ (reply) своему сообщению.
+
+## Ограничения
+
+- DeepSeek **не генерирует** изображения — бот только анализирует присланные картинки и умеет вставлять ссылки на изображения, если они есть в ответе модели.
+- Telegram Bot API даёт скачивать файлы до 20 МБ, поэтому очень большие фото бот не обработает.
+- Ответы длиннее 4096 символов разбиваются на несколько сообщений.
+
+## Лицензия
+
+MIT — см. [LICENSE](LICENSE).

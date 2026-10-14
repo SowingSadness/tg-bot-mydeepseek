@@ -1,0 +1,13 @@
+services:
+  bot:
+    build: .
+    image: tg-bot-mydeepseek:latest
+    container_name: tg-bot-mydeepseek
+    env_file:
+      - .env
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"

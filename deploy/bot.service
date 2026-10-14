@@ -1,0 +1,31 @@
+# systemd-юнит для запуска бота без Docker (нативный вариант).
+# Подходит для Debian/Ubuntu.
+#
+# Установка:
+#   sudo cp deploy/bot.service /etc/systemd/system/tg-bot-mydeepseek.service
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now tg-bot-mydeepseek
+
+[Unit]
+Description=Telegram DeepSeek bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/tg-bot-mydeepseek
+EnvironmentFile=/opt/tg-bot-mydeepseek/.env
+ExecStart=/opt/tg-bot-mydeepseek/.venv/bin/python -m bot.main
+Restart=always
+RestartSec=5
+User=bot
+Group=bot
+
+# Базовая изоляция
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=true
+
+[Install]
+WantedBy=multi-user.target
