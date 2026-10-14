@@ -32,10 +32,14 @@ class DeepSeekClient:
         text: str,
         images: Sequence[str] | None = None,
         thinking: bool = False,
+        max_tokens: int | None = None,
+        system: str | None = None,
     ) -> str:
         """Отправляет запрос и возвращает текст ответа.
 
         ``images`` — список ссылок: data-URL (base64) или публичных http(s)-адресов.
+        ``max_tokens`` ограничивает длину ответа (ускоряет генерацию).
+        ``system`` — необязательный системный промпт.
         """
         content: str | list[dict]
         if images:
@@ -52,11 +56,17 @@ class DeepSeekClient:
         if thinking:
             extra_body["reasoning_effort"] = "high"
 
+        messages: list[dict] = []
+        if system:
+            messages.append({"role": "system", "content": system})
+        messages.append({"role": "user", "content": content})
+
         try:
             response = await self._client.chat.completions.create(
                 model=self._model,
-                messages=[{"role": "user", "content": content}],
+                messages=messages,
                 extra_body=extra_body,
+                max_tokens=max_tokens,
             )
         except APITimeoutError as exc:
             raise DeepSeekError("DeepSeek не ответил вовремя. Попробуйте ещё раз.") from exc
