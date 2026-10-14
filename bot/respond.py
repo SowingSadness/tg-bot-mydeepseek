@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import time
 from io import BytesIO
 
 from aiogram.enums import ChatAction
@@ -43,15 +44,28 @@ async def ask_and_reply(
 ) -> None:
     """Отправляет запрос в DeepSeek и публикует ответ в чат."""
     await message.bot.send_chat_action(chat_id=message.chat.id, action=ChatAction.TYPING)
+    thinking = is_thinking(message.from_user.id)
+    started = time.perf_counter()
     try:
         answer = await deepseek.ask(
             prompt,
             images=images,
-            thinking=is_thinking(message.from_user.id),
+            thinking=thinking,
+            max_tokens=settings.chat_max_tokens or None,
         )
     except DeepSeekError as exc:
+        log.info(
+            "chat user=%d: error total=%.2fs %s",
+            message.from_user.id, time.perf_counter() - started, exc,
+        )
         await message.reply(f"⚠️ {exc}")
         return
+
+    log.info(
+        "chat user=%d: total=%.2fs chars=%d images=%d thinking=%s",
+        message.from_user.id, time.perf_counter() - started, len(answer),
+        len(images or []), thinking,
+    )
 
     chunks = split_message(answer)
     for index, chunk in enumerate(chunks):

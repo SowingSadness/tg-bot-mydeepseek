@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import logging
-from typing import Sequence
+from typing import AsyncIterator, Sequence
 
 from openai import NOT_GIVEN, APIError, APIStatusError, APITimeoutError, AsyncOpenAI
 
@@ -27,20 +27,14 @@ class DeepSeekClient:
         self._client = AsyncOpenAI(api_key=api_key, base_url=base_url, timeout=timeout)
         self._model = model
 
-    async def ask(
+    def _build_payload(
         self,
         text: str,
-        images: Sequence[str] | None = None,
-        thinking: bool = False,
-        max_tokens: int | None = None,
-        system: str | None = None,
-    ) -> str:
-        """Отправляет запрос и возвращает текст ответа.
-
-        ``images`` — список ссылок: data-URL (base64) или публичных http(s)-адресов.
-        ``max_tokens`` ограничивает длину ответа (ускоряет генерацию).
-        ``system`` — необязательный системный промпт.
-        """
+        images: Sequence[str] | None,
+        thinking: bool,
+        max_tokens: int | None,
+        system: str | None,
+    ) -> dict:
         content: str | list[dict]
         if images:
             blocks: list[dict] = []
@@ -61,13 +55,31 @@ class DeepSeekClient:
             messages.append({"role": "system", "content": system})
         messages.append({"role": "user", "content": content})
 
+        return {
+            "model": self._model,
+            "messages": messages,
+            "extra_body": extra_body,
+            # Явный None SDK отправляет как "max_tokens": null, поэтому NOT_GIVEN.
+            "max_tokens": max_tokens if max_tokens is not None else NOT_GIVEN,
+        }
+
+    async def ask(
+        self,
+        text: str,
+        images: Sequence[str] | None = None,
+        thinking: bool = False,
+        max_tokens: int | None = None,
+        system: str | None = None,
+    ) -> str:
+        """Отправляет запрос и возвращает текст ответа целиком.
+
+        ``images`` — список ссылок: data-URL (base64) или публичных http(s)-адресов.
+        ``max_tokens`` ограничивает длину ответа (ускоряет генерацию).
+        ``system`` — необязательный системный промпт.
+        """
+        payload = self._build_payload(text, images, thinking, max_tokens, system)
         try:
-            response = await self._client.chat.completions.create(
-                model=self._model,
-                messages=messages,
-                extra_body=extra_body,
-                max_tokens=max_tokens if max_tokens is not None else NOT_GIVEN,
-            )
+            response = await self._client.chat.completions.create(**payload)
         except APITimeoutError as exc:
             raise DeepSeekError("DeepSeek не ответил вовремя. Попробуйте ещё раз.") from exc
         except APIStatusError as exc:
@@ -76,11 +88,48 @@ class DeepSeekClient:
             log.exception("Ошибка DeepSeek API")
             raise DeepSeekError(f"Ошибка DeepSeek API: {exc}") from exc
 
-        message = response.choices[0].message
-        answer = (message.content or "").strip()
+        answer = (response.choices[0].message.content or "").strip()
         if not answer:
             raise DeepSeekError("Модель вернула пустой ответ. Переформулируйте запрос.")
         return answer
+
+    async def stream(
+        self,
+        text: str,
+        images: Sequence[str] | None = None,
+        thinking: bool = False,
+        max_tokens: int | None = None,
+        system: str | None = None,
+    ) -> AsyncIterator[str]:
+        """Отдаёт куски ответа по мере генерации.
+
+        Нужен там, где важен первый байт: Telegram аннулирует inline-запрос
+        примерно через 10 секунд, поэтому частичный ответ лучше, чем ничего.
+        """
+        payload = self._build_payload(text, images, thinking, max_tokens, system)
+        try:
+            stream = await self._client.chat.completions.create(**payload, stream=True)
+        except APITimeoutError as exc:
+            raise DeepSeekError("DeepSeek не ответил вовремя. Попробуйте ещё раз.") from exc
+        except APIStatusError as exc:
+            raise DeepSeekError(self._describe(exc)) from exc
+        except APIError as exc:
+            raise DeepSeekError(f"Ошибка DeepSeek API: {exc}") from exc
+
+        try:
+            async for chunk in stream:
+                if not chunk.choices:
+                    continue
+                piece = chunk.choices[0].delta.content
+                if piece:
+                    yield piece
+        except APIError as exc:
+            raise DeepSeekError(f"Ошибка DeepSeek API: {exc}") from exc
+        finally:
+            try:
+                await stream.close()
+            except Exception:  # noqa: BLE001
+                pass
 
     @staticmethod
     def _describe(exc: APIStatusError) -> str:

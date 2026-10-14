@@ -38,6 +38,19 @@ def extract_image_urls(text: str, limit: int = 10) -> list[str]:
     return urls[:limit]
 
 
+_JPEG_SUFFIXES = (".jpg", ".jpeg")
+
+
+def is_jpeg_url(url: str) -> bool:
+    """Telegram принимает превью только в JPEG.
+
+    Для PNG/WebP превью в inline молча пропадает, поэтому такие ссылки в
+    ``thumbnail_url`` лучше не отдавать.
+    """
+    path = url.split("?", 1)[0].split("#", 1)[0].lower()
+    return path.endswith(_JPEG_SUFFIXES)
+
+
 def markdown_to_html(text: str) -> str:
     """Грубое, но безопасное преобразование Markdown в HTML для Telegram."""
     stash: list[str] = []

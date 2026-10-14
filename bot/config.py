@@ -23,11 +23,19 @@ class Settings(BaseSettings):
     request_timeout: float = 180.0
     log_level: str = "INFO"
 
+    # Лимит длины ответов в личке/группах. 0 = без ограничения.
+    chat_max_tokens: int = 0
+
     # Настройки inline-режима (Telegram даёт на ответ ~10 секунд).
     inline_timeout: float = 8.5
     inline_max_tokens: int = 350
     inline_cache_ttl: int = 300
     warmup_on_start: bool = True
+
+    # Прогрессивный ответ: показать частичный результат, не дожидаясь конца генерации.
+    inline_early_update: bool = True
+    inline_early_delay: float = 1.2
+    inline_early_min_chars: int = 120
 
     # Список ID через запятую. Пусто = доступ открыт всем.
     allowed_user_ids: str = ""
