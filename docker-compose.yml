@@ -17,6 +17,8 @@ services:
       # В контейнере слушаем все интерфейсы, наружу порт публикуется только на loopback.
       CMP_WEBAPP_HOST: 0.0.0.0
       CMP_WEBAPP_PORT: "8081"
+      # Таймзона логов: берётся из окружения (по умолчанию — московская).
+      TZ: ${TZ:-Europe/Moscow}
     logging:
       driver: json-file
       options:
