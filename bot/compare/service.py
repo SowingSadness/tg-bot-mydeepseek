@@ -42,6 +42,11 @@ NEED_TWO_TEXT = (
     "Нужны две картинки: прикрепите оба фото одним альбомом и подпишите /cmp, "
     "или пришлите ссылки: /cmp https://a.jpg https://b.jpg"
 )
+#: Дополнение для групп: без выключенного privacy mode второе фото не доёдет.
+GROUP_ALBUM_HINT = (
+    "\n\nВ группе остальные фото альбома приходят боту, только если у него выключен "
+    "privacy mode (в @BotFather: /setprivacy → Disable). Иначе пришлите две ссылки."
+)
 #: Не удалось уложить картинки в лимиты виджета.
 TOO_LARGE_TEXT = (
     "Картинки слишком пёстрые, чтобы уместиться в бабл — пришлите картинки поменьше."
@@ -174,6 +179,14 @@ def _drop_album(key: AlbumKey, album: Album) -> None:
         task.cancel()
 
 
+def _need_two_text(message) -> str:
+    """Подсказка «нужны две картинки»: в группах — с оговоркой про privacy mode."""
+    chat_type = getattr(getattr(message, "chat", None), "type", None)
+    if chat_type in {"group", "supergroup"}:
+        return NEED_TWO_TEXT + GROUP_ALBUM_HINT
+    return NEED_TWO_TEXT
+
+
 def _flush(key: AlbumKey) -> None:
     """Забирает буфер: две картинки — сравнение, одна — инструкция. Буфер пуст."""
     album = _albums.get(key)
@@ -204,7 +217,7 @@ def _flush(key: AlbumKey) -> None:
         )
         return
 
-    asyncio.create_task(album.message.answer(NEED_TWO_TEXT))
+    asyncio.create_task(album.message.answer(_need_two_text(album.message)))
 
 
 def _after_append(key: AlbumKey, album: Album) -> None:
@@ -387,7 +400,7 @@ async def compare_images(message, a: bytes, b: bytes) -> None:
 
     if settings.cmp_show_hint:
         await message.answer(
-            f"Номер сравнения: #{cmp_id}. В любом чате: @{settings.bot_username} #{cmp_id}"
+            f"Номер сравнения: #{cmp_id}. Пришлите /cmp #{cmp_id}, чтобы получить бабл «ещё раз."
         )
 
 

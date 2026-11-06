@@ -702,3 +702,54 @@ async def test_cmp_with_number_falls_back_to_album_when_widget_refused(env):
 
     assert len(message.media_groups) == 1
     assert any(f"#{CMP_ID}" in answer for answer in message.answers)
+
+
+# ------------------------------------------------------------ группы
+
+
+async def test_cmp_works_in_group_with_command_mention(env, monkeypatch):
+    """`/cmp@bot` из группы: та же сборка, виджет уходит в чат группы."""
+    async def fake_download(session, url, *, max_bytes, timeout, allow_private):
+        return PNG_A if "one" in url else PNG_B
+
+    monkeypatch.setattr(images, "download_url", fake_download)
+
+    group = FakeMessage(
+        env.calls,
+        text="/cmp@sowing_tg_bot https://a.test/one.jpg https://b.test/two.jpg",
+    )
+    group.chat = SimpleNamespace(id=-100500, type="supergroup")
+    await compare_handlers.on_cmp(group)
+
+    widgets = _widgets(env.calls)
+    assert len(widgets) == 1
+    assert widgets[0][1] == -100500  # чат группы, не личка
+    assert len(_saves(env.calls)) == 1
+
+
+async def test_group_chats_are_allowed_channel_is_not():
+    assert {"private", "group", "supergroup"} <= set(compare_handlers.CMP_CHATS)
+    assert "channel" not in compare_handlers.CMP_CHATS
+
+
+def test_need_two_text_mentions_privacy_only_in_groups():
+    private = FakeMessage([])
+    group = FakeMessage([])
+    group.chat = SimpleNamespace(id=-1, type="supergroup")
+
+    assert service._need_two_text(private) == service.NEED_TWO_TEXT
+    assert "privacy mode" in service._need_two_text(group)
+
+
+async def test_cmp_number_resend_works_in_group(env):
+    """`/cmp #номер` в группе — бабл в групповой чат из кеша."""
+    env.calls.clear()
+    service.configure_store(CachedStore(env.calls, _cached()))
+    message = FakeMessage(env.calls, text=f"/cmp@sowing_tg_bot #{CMP_ID}")
+    message.chat = SimpleNamespace(id=-100500, type="supergroup")
+
+    await compare_handlers.on_cmp(message)
+
+    widgets = _widgets(env.calls)
+    assert len(widgets) == 1
+    assert widgets[0][1] == -100500
