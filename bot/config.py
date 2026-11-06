@@ -80,6 +80,10 @@ class Settings(BaseSettings):
     cmp_webapp_short_name: str = ""
     # Ширина композита-превью «A|B» в пикселях (Telegram ужмёт по длинной стороне).
     cmp_preview_width: int = 2560
+    # Отдавать ли в inline-выдаче саму шторку (widget-контент).
+    # Бета Bot API отклоняет widget в inline (INPUT_MEDIA_WIDGET_NOT_ALLOWED),
+    # поэтому по умолчанию false: остаются фото-превью, кнопка и текстовый результат.
+    cmp_inline_widget: bool = False
 
     @field_validator("cmp_labels")
     @classmethod

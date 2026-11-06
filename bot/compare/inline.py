@@ -6,8 +6,13 @@ Inline-режим обязан ответить примерно за 10 сек�
 
 Выдача на найденный номер — до трёх результатов в таком порядке:
 фото-композит (если есть ``preview_file_id``), article с url-кнопкой
-«Открыть сравнение» (если задан ``CMP_WEBAPP_SHORT_NAME``) и всегда —
-прежний article с виджетом-шторкой.
+«Открыть сравнение» (если задан ``CMP_WEBAPP_SHORT_NAME``) и текстовый
+результат (всегда, чтобы выдача не была пустой).
+
+Шторка (widget-контент) в inline отдаётся только при ``CMP_INLINE_WIDGET=true``:
+бета Bot API отклоняет widget в inline-выдаче (``INPUT_MEDIA_WIDGET_NOT_ALLOWED``),
+поэтому по умолчанию её нет, а при включённом флаге отказ сервера приводит к
+повтору без шторки (фото, кнопка и текст остаются).
 
 Голый ``#`` и номера короче шести цифр — подсказка; всё, что не похоже на
 ``#<6-8 цифр>``, отдаём обычному DeepSeek-пути (``False``).
@@ -99,18 +104,39 @@ def _open_result(cached: Cached) -> dict:
     }
 
 
-def _found_results(cached: Cached) -> list[dict]:
-    """Все результаты для найденного сравнения: фото → кнопка → шторка.
+def _text_result(cached: Cached) -> dict:
+    """Текст на случай, когда фото и кнопки нет или их не вставили."""
+    first, second = settings.cmp_labels_pair
+    if settings.cmp_webapp_short_name and settings.bot_username:
+        tail = "Полноразмерное сравнение — кнопкой «Открыть сравнение»."
+    else:
+        tail = "Откройте бота в личке и пришлите две картинки командой /cmp."
+    return {
+        "type": "article",
+        "id": f"{cached.id}-text",
+        "title": f"Сравнение #{cached.id}",
+        "description": f"{first} / {second}",
+        "input_message_content": {
+            "message_text": f"Сравнение #{cached.id} · {first} / {second}\n{tail}",
+        },
+    }
 
-    Шторка (виджет) остаётся последней и есть всегда; фото и кнопка —
-    необязательные украшения, без них выдача деградирует до прежней.
+
+def _found_results(cached: Cached) -> list[dict]:
+    """Результаты для найденного сравнения: фото → кнопка → текст (→ шторка).
+
+    Текстовый результат есть всегда: без него (если нет ни ``preview_file_id``,
+    ни мини-аппа) выдача была бы пустой. Шторка идёт последней и толькo при
+    ``CMP_INLINE_WIDGET=true``: бета Bot API отклоняет widget в inline.
     """
     results: list[dict] = []
     if cached.preview_file_id:
         results.append(_photo_result(cached))
     if settings.cmp_webapp_short_name and settings.bot_username:
         results.append(_open_result(cached))
-    results.append(_found_result(cached))
+    results.append(_text_result(cached))
+    if settings.cmp_inline_widget:
+        results.append(_found_result(cached))
     return results
 
 
@@ -213,7 +239,17 @@ async def try_answer(query) -> bool:
             return True
 
         results = _found_results(cached)
-        await _answer(api, query, results)
+        try:
+            await _answer(api, query, results)
+        except api_module.WidgetAPIError:
+            # Сервер не принял widget-контент (INPUT_MEDIA_WIDGET_NOT_ALLOWED):
+            # повторяем без шторки — фото, кнопка и текстовый результат остаются.
+            fallback = [result for result in results if result["id"] != cached.id]
+            if len(fallback) == len(results):
+                raise
+            await _answer(api, query, fallback)
+            log.info("inline[%s]: сервер отклонил шторку, выдача без виджета", tag)
+            results = fallback
         log.info(
             "inline[%s]: сравнение #%s из кеша (width=%d, quality=%d, zlib=%d, results=%s)",
             tag, cached.id, cached.width, cached.quality, cached.zlib_bytes,

@@ -9,7 +9,6 @@ from types import SimpleNamespace
 import pytest
 
 from bot.compare import api as api_module
-from bot.compare import build
 from bot.compare import inline as compare_inline
 from bot.compare import service
 from bot.compare.api import WidgetAPIError
@@ -122,6 +121,7 @@ def _clean_singletons(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr(api_module, "_api", None)
     monkeypatch.setattr(settings, "cmp_share_by_id", False)
     monkeypatch.setattr(settings, "cmp_webapp_short_name", "")
+    monkeypatch.setattr(settings, "cmp_inline_widget", False)
     yield
 
 
@@ -155,8 +155,8 @@ def test_id_re_rejects_everything_else(text: str):
 # ------------------------------------------------------- multi-result payload
 
 
-async def test_found_comparison_returns_photo_open_and_widget(monkeypatch: pytest.MonkeyPatch):
-    """Порядок выдачи: фото-превью → кнопка мини-аппа → шторка."""
+async def test_found_comparison_returns_photo_open_and_text(monkeypatch: pytest.MonkeyPatch):
+    """Порядок выдачи: фото-превью → кнопка мини-аппа → текст (без шторки)."""
     monkeypatch.setattr(settings, "cmp_webapp_short_name", SHORT_NAME)
     store = FakeStore(cached(preview_file_id=PREVIEW_FILE_ID))
     api = FakeAPI()
@@ -173,7 +173,7 @@ async def test_found_comparison_returns_photo_open_and_widget(monkeypatch: pytes
     assert [result["id"] for result in results] == [
         f"{CMP_ID}-photo",
         f"{CMP_ID}-open",
-        CMP_ID,
+        f"{CMP_ID}-text",
     ]
 
     first, second = settings.cmp_labels_pair
@@ -201,10 +201,12 @@ async def test_found_comparison_returns_photo_open_and_widget(monkeypatch: pytes
     # Без экранированной/литеральной точки: Telegram ждёт base64url.
     assert "%2E" not in button["url"] and "." not in token
 
-    # Последним всегда идёт прежний article со шторкой (html-виджет).
-    widget = results[2]
-    assert "html" in widget["input_message_content"]
-    assert widget["input_message_content"]["width"] == 0
+    # Текстовый результат есть всегда; шторки (widget-контента) по умолчанию нет.
+    text_result = results[2]
+    assert "html" not in text_result["input_message_content"]
+    assert text_result["input_message_content"]["message_text"].startswith(
+        f"Сравнение #{CMP_ID} · {first} / {second}"
+    )
 
 
 @pytest.mark.parametrize("preview_file_id", [None, ""])
@@ -220,7 +222,7 @@ async def test_photo_result_absent_without_preview_file_id(
     assert await compare_inline.try_answer(make_query(f"#{CMP_ID}")) is True
 
     results = _results(api)
-    assert [result["id"] for result in results] == [f"{CMP_ID}-open", CMP_ID]
+    assert [result["id"] for result in results] == [f"{CMP_ID}-open", f"{CMP_ID}-text"]
     assert all("photo_file_id" not in result for result in results)
 
 
@@ -232,11 +234,11 @@ async def test_open_result_absent_without_short_name():
     assert await compare_inline.try_answer(make_query(f"#{CMP_ID}")) is True
 
     results = _results(api)
-    assert [result["id"] for result in results] == [f"{CMP_ID}-photo", CMP_ID]
+    assert [result["id"] for result in results] == [f"{CMP_ID}-photo", f"{CMP_ID}-text"]
     assert all("reply_markup" not in result for result in results)
 
 
-async def test_without_preview_and_short_name_only_widget_remains():
+async def test_without_preview_and_short_name_only_text_remains():
     store = FakeStore(cached())
     api = FakeAPI()
     configure(store, api)
@@ -244,9 +246,10 @@ async def test_without_preview_and_short_name_only_widget_remains():
     assert await compare_inline.try_answer(make_query(f"#{CMP_ID}")) is True
 
     results = _results(api)
-    assert [result["id"] for result in results] == [CMP_ID]
+    assert [result["id"] for result in results] == [f"{CMP_ID}-text"]
     assert results[0]["type"] == "article"
-    assert "html" in results[0]["input_message_content"]
+    assert "html" not in results[0]["input_message_content"]
+    assert "Откройте бота в личке" in results[0]["input_message_content"]["message_text"]
 
 
 def test_start_token_is_short_base64url_and_stable():
@@ -269,7 +272,7 @@ def test_start_token_is_short_base64url_and_stable():
 # ------------------------------------------------------------- found / missing
 
 
-async def test_own_comparison_returns_one_widget_article():
+async def test_own_comparison_returns_one_text_article():
     store = FakeStore(cached())
     api = FakeAPI()
     configure(store, api)
@@ -284,23 +287,61 @@ async def test_own_comparison_returns_one_widget_article():
 
     article = _article(api)
     assert article["type"] == "article"
-    assert article["id"] == CMP_ID
+    assert article["id"] == f"{CMP_ID}-text"
     assert article["title"] == f"Сравнение #{CMP_ID}"
-
-    expected_html = build.render_cached(
-        image_a=IMAGE_A,
-        image_b=IMAGE_B,
-        labels=settings.cmp_labels_pair,
-        title=settings.cmp_title,
-        hint=settings.cmp_hint,
-        # Inline-ветка передаёт ширину из кеша: у слоёв есть запечённые width/height.
-        width=cached().width,
+    # По умолчанию widget-контента в inline нет: бета его отклоняет.
+    assert set(article["input_message_content"]) == {"message_text"}
+    assert article["input_message_content"]["message_text"].startswith(
+        f"Сравнение #{CMP_ID}"
     )
-    assert article["input_message_content"] == {
-        "html": expected_html,
-        "width": 0,
-        "height": 0,
-    }
+
+
+async def test_widget_result_included_when_enabled(monkeypatch: pytest.MonkeyPatch):
+    """CMP_INLINE_WIDGET=true — шторка возвращается последним результатом."""
+    monkeypatch.setattr(settings, "cmp_inline_widget", True)
+    store = FakeStore(cached())
+    api = FakeAPI()
+    configure(store, api)
+
+    assert await compare_inline.try_answer(make_query(f"#{CMP_ID}")) is True
+
+    results = _results(api)
+    assert [result["id"] for result in results] == [f"{CMP_ID}-text", CMP_ID]
+    widget = results[-1]
+    assert "html" in widget["input_message_content"]
+    assert widget["input_message_content"]["width"] == 0
+
+
+class WidgetRefusingAPI(FakeAPI):
+    """Bot API, который отклоняет widget-контент (как бета в inline)."""
+
+    async def answer_inline(self, query_id, results, *, cache_time=0, is_personal=True):
+        if any("html" in (result.get("input_message_content") or {}) for result in results):
+            raise WidgetAPIError(400, "INPUT_MEDIA_WIDGET_NOT_ALLOWED")
+        await super().answer_inline(
+            query_id, results, cache_time=cache_time, is_personal=is_personal
+        )
+
+
+async def test_refused_widget_is_retried_without_it(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setattr(settings, "cmp_inline_widget", True)
+    monkeypatch.setattr(settings, "cmp_webapp_short_name", SHORT_NAME)
+    store = FakeStore(cached(preview_file_id=PREVIEW_FILE_ID))
+    api = WidgetRefusingAPI()
+    configure(store, api)
+
+    assert await compare_inline.try_answer(make_query(f"#{CMP_ID}")) is True
+
+    # Первый ответ со шторкой сервер отклонил; в итоге ушла выдача без неё.
+    assert len(api.calls) == 1
+    results = _results(api)
+    assert [result["id"] for result in results] == [
+        f"{CMP_ID}-photo",
+        f"{CMP_ID}-open",
+        f"{CMP_ID}-text",
+    ]
+    assert all("html" not in (result.get("input_message_content") or {}) for result in results)
+
 
 
 async def test_foreign_comparison_without_share_is_missing():
@@ -344,7 +385,7 @@ async def test_share_by_id_finds_foreign_comparison(monkeypatch: pytest.MonkeyPa
     assert await compare_inline.try_answer(make_query(f"#{CMP_ID}")) is True
 
     assert store.calls == [(CMP_ID, None)]
-    assert _article(api)["id"] == CMP_ID
+    assert _article(api)["id"] == f"{CMP_ID}-text"
 
 
 async def test_unknown_number_returns_missing_hint():
@@ -417,7 +458,7 @@ async def test_widget_api_error_does_not_break_multi_result_answer(monkeypatch: 
     assert [result["id"] for result in _results(api)] == [
         f"{CMP_ID}-photo",
         f"{CMP_ID}-open",
-        CMP_ID,
+        f"{CMP_ID}-text",
     ]
 
 
