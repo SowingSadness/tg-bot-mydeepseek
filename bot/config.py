@@ -70,6 +70,9 @@ class Settings(BaseSettings):
     cmp_share_by_id: bool = False
     cmp_show_hint: bool = True
     cmp_allow_private_hosts: bool = False
+    #: BETA-контур принимает sendWidget только в личке: в группах/каналах Telegram
+    #: отвечает INPUT_MEDIA_WIDGET_NOT_ALLOWED. В группах сразу шлём альбом.
+    cmp_widget_group: bool = False
     cmp_labels: str = "До|После"
     cmp_caption: str = "Сравнение #{id} · {a} / {b}"
     cmp_title: str = "Сравнение"

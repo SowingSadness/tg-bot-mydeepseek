@@ -25,9 +25,11 @@ from __future__ import annotations
 import asyncio
 import logging
 from dataclasses import dataclass, field
+from io import BytesIO
 from types import SimpleNamespace
 
-from aiogram.types import BufferedInputFile, InputMediaDocument
+from aiogram.types import BufferedInputFile, InputMediaPhoto
+from PIL import Image
 
 from .. import respond
 from ..config import settings
@@ -179,6 +181,26 @@ def _drop_album(key: AlbumKey, album: Album) -> None:
         task.cancel()
 
 
+async def _send_text(message, text: str) -> None:
+    """Отправляет текст отдельной задачей.
+
+    Обёртка нужна потому, что в aiogram 3.31 `message.answer()` возвращает не
+    корутину, а объект `SendMessage`: `asyncio.create_task` на нём падает.
+    """
+    await message.answer(text)
+
+
+def _widget_allowed(chat) -> bool:
+    """Можно ли пробовать `sendWidget` в этом чате.
+
+    Бета Bot API принимает виджет только в личке: в группах и каналах она отвечает
+    `INPUT_MEDIA_WIDGET_NOT_ALLOWED`, поэтому там сразу идёт альбом картинок
+    (без лишнего запроса и пяти секунд ожидания). Включается `CMP_WIDGET_GROUP=true`.
+    """
+    chat_type = getattr(chat, "type", None)
+    return settings.cmp_widget_group or chat_type in {None, "private"}
+
+
 def _need_two_text(message) -> str:
     """Подсказка «нужны две картинки»: в группах — с оговоркой про privacy mode."""
     chat_type = getattr(getattr(message, "chat", None), "type", None)
@@ -223,7 +245,7 @@ def _flush(key: AlbumKey) -> None:
         "cmp: в альбоме %s только %d картинка — отправляю подсказку",
         key, len(album.images),
     )
-    asyncio.create_task(album.message.answer(_need_two_text(album.message)))
+    asyncio.create_task(_send_text(album.message, _need_two_text(album.message)))
 
 
 def _after_append(key: AlbumKey, album: Album) -> None:
@@ -405,6 +427,16 @@ async def compare_images(message, a: bytes, b: bytes) -> None:
     )
 
     api = api_module.get_api()
+    if not _widget_allowed(message.chat):
+        log.info(
+            "cmp #%s: в чате %s виджеты недоступны — отправляю альбом",
+            cmp_id, getattr(message.chat, "type", "-"),
+        )
+        await _send_fallback(
+            message, caption, built, hint=f"Номер сравнения: #{cmp_id}"
+        )
+        return
+
     try:
         await api.send_widget(message.chat.id, html, caption=caption, width=0, height=0)
     except api_module.WidgetAPIError as exc:
@@ -429,23 +461,39 @@ async def compare_images(message, a: bytes, b: bytes) -> None:
         )
 
 
-async def _send_fallback(message, caption: str, built: build.Built) -> None:
-    """Клиент не принял виджет: отдаём те же WebP альбомом и номер в тексте."""
-    media = [
-        InputMediaDocument(
-            media=BufferedInputFile(built.image_a, filename="before.webp")
-        ),
-        InputMediaDocument(
-            media=BufferedInputFile(built.image_b, filename="after.webp")
-        ),
-    ]
+def _as_jpeg(data: bytes, quality: int = 92) -> bytes:
+    """WebP-превью из кеша → JPEG для альбома-фолбэка."""
+    with Image.open(BytesIO(data)) as source:
+        buffer = BytesIO()
+        source.convert("RGB").save(buffer, format="JPEG", quality=quality, optimize=True)
+        return buffer.getvalue()
+
+
+async def _send_fallback(
+    message, caption: str, built: build.Built, *, hint: str | None = None
+) -> None:
+    """Клиент не принял виджет: отдаём те же картинки альбомом и номер в тексте.
+
+    WebP документами в медиагруппе Telegram не принимает (`Wrong file identifier`),
+    поэтому превью перекодируются в JPEG: они же в WebP — это уже сжатые превью
+    из кеша, потерь почти нет, зато альбом гарантированно доходит.
+    """
     try:
+        media = [
+            InputMediaPhoto(
+                media=BufferedInputFile(_as_jpeg(built.image_a), filename="before.jpg")
+            ),
+            InputMediaPhoto(
+                media=BufferedInputFile(_as_jpeg(built.image_b), filename="after.jpg")
+            ),
+        ]
         await message.answer_media_group(media)
     except Exception:  # noqa: BLE001 — номер всё равно должен дойти текстом
         log.exception("Не удалось отправить альбом с картинками сравнения")
 
     await message.answer(
         f"{caption}\n\n⚠️ Клиент не принял виджет — отправляю обе картинки альбомом."
+        + (f"\n{hint}" if hint else "")
     )
 
 
@@ -479,6 +527,15 @@ async def resend_cached(message, digits: str) -> None:
     )
 
     api = api_module.get_api()
+    if not _widget_allowed(message.chat):
+        await _send_fallback(
+            message,
+            caption,
+            SimpleNamespace(image_a=cached.image_a, image_b=cached.image_b),
+            hint=f"Номер сравнения: #{cached.id}",
+        )
+        return
+
     try:
         await api.send_widget(message.chat.id, html, caption=caption, width=0, height=0)
     except api_module.WidgetAPIError as exc:

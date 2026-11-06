@@ -32,6 +32,7 @@ EXPECTED_DEFAULTS: dict[str, object] = {
     "cmp_share_by_id": False,
     "cmp_show_hint": True,
     "cmp_allow_private_hosts": False,
+    "cmp_widget_group": False,
     "cmp_labels": "До|После",
     "cmp_caption": "Сравнение #{id} · {a} / {b}",
     "cmp_title": "Сравнение",
@@ -48,7 +49,7 @@ def _env_example_keys() -> set[str]:
 
 
 def test_all_new_fields_declared() -> None:
-    assert len(NEW_FIELDS) == 21
+    assert len(NEW_FIELDS) == 22
     missing = [name for name in NEW_FIELDS if name not in Settings.model_fields]
     assert not missing, f"в Settings нет полей: {missing}"
 

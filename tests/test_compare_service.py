@@ -577,7 +577,9 @@ async def test_widget_api_error_falls_back_to_album_and_reports_id(env):
     assert len(_saves(env.calls)) == 1
     assert len(message.media_groups) == 1
     media = message.media_groups[0]
-    assert [item.media.filename for item in media] == ["before.webp", "after.webp"]
+    # JPEG, а не WebP: WebP-документы Telegram в медиагруппе не принимает.
+    assert [item.media.filename for item in media] == ["before.jpg", "after.jpg"]
+    assert all(item.type == "photo" for item in media)
     assert any(f"#{CMP_ID}" in answer for answer in message.answers)
 
 
@@ -646,6 +648,13 @@ class CachedStore:
         return self.item
 
 
+def _webp(color: tuple[int, int, int]) -> bytes:
+    """Настоящий WebP: фолбэк перекодирует его в JPEG для альбома."""
+    buffer = BytesIO()
+    Image.new("RGB", (40, 30), color).save(buffer, format="WEBP", quality=40)
+    return buffer.getvalue()
+
+
 def _cached(cmp_id: str = CMP_ID, owner_id: int = USER_ID):
     from bot.compare.store import Cached
 
@@ -657,8 +666,8 @@ def _cached(cmp_id: str = CMP_ID, owner_id: int = USER_ID):
         quality=34,
         labels=("До", "После"),
         zlib_bytes=1024,
-        image_a=b"RIFF-a-webp-bytes",
-        image_b=b"RIFF-b-webp-bytes",
+        image_a=_webp((200, 20, 20)),
+        image_b=_webp((20, 20, 200)),
     )
 
 
@@ -708,7 +717,7 @@ async def test_cmp_with_number_falls_back_to_album_when_widget_refused(env):
 
 
 async def test_cmp_works_in_group_with_command_mention(env, monkeypatch):
-    """`/cmp@bot` из группы: та же сборка, виджет уходит в чат группы."""
+    """`/cmp@bot` из группы: бета не принимает виджеты в группах — идёт альбом."""
     async def fake_download(session, url, *, max_bytes, timeout, allow_private):
         return PNG_A if "one" in url else PNG_B
 
@@ -721,10 +730,11 @@ async def test_cmp_works_in_group_with_command_mention(env, monkeypatch):
     group.chat = SimpleNamespace(id=-100500, type="supergroup")
     await compare_handlers.on_cmp(group)
 
-    widgets = _widgets(env.calls)
-    assert len(widgets) == 1
-    assert widgets[0][1] == -100500  # чат группы, не личка
     assert len(_saves(env.calls)) == 1
+    # В группе sendWidget не пробуем: бета отвечает INPUT_MEDIA_WIDGET_NOT_ALLOWED.
+    assert not _widgets(env.calls)
+    assert len(group.media_groups) == 1
+    assert any(f"#{CMP_ID}" in answer for answer in group.answers)
 
 
 async def test_group_chats_are_allowed_channel_is_not():
@@ -742,7 +752,7 @@ def test_need_two_text_mentions_privacy_only_in_groups():
 
 
 async def test_cmp_number_resend_works_in_group(env):
-    """`/cmp #номер` в группе — бабл в групповой чат из кеша."""
+    """`/cmp #номер` в группе — картинки из кеша альбомом без запроса sendWidget."""
     env.calls.clear()
     service.configure_store(CachedStore(env.calls, _cached()))
     message = FakeMessage(env.calls, text=f"/cmp@sowing_tg_bot #{CMP_ID}")
@@ -750,6 +760,18 @@ async def test_cmp_number_resend_works_in_group(env):
 
     await compare_handlers.on_cmp(message)
 
-    widgets = _widgets(env.calls)
-    assert len(widgets) == 1
-    assert widgets[0][1] == -100500
+    assert not _widgets(env.calls)
+    assert len(message.media_groups) == 1
+    assert any(f"#{CMP_ID}" in answer for answer in message.answers)
+
+
+def test_widget_allowed_only_in_private_by_default():
+    assert service._widget_allowed(SimpleNamespace(type="private")) is True
+    assert service._widget_allowed(SimpleNamespace(type="group")) is False
+    assert service._widget_allowed(SimpleNamespace(type="supergroup")) is False
+    assert service._widget_allowed(SimpleNamespace(type="channel")) is False
+
+
+def test_widget_in_groups_can_be_forced_by_config(monkeypatch):
+    monkeypatch.setattr(settings, "cmp_widget_group", True)
+    assert service._widget_allowed(SimpleNamespace(type="supergroup")) is True
