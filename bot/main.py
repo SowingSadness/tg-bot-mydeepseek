@@ -17,6 +17,7 @@ from .compare.store import ComparisonStore
 from .config import settings
 from .deepseek import deepseek
 from .handlers import compare, group, inline, private
+from .respond import close_file_session
 
 log = logging.getLogger(__name__)
 
@@ -190,6 +191,8 @@ async def main() -> None:
             with suppress(asyncio.CancelledError):
                 await task
         await teardown_compare()
+        with suppress(Exception):  # noqa: BLE001 — сессия файлов может быть не создана
+            await close_file_session()
         await bot.session.close()
 
 
