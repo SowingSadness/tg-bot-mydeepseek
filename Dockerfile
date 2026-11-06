@@ -11,7 +11,10 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY bot ./bot
 
-RUN useradd --create-home --shell /usr/sbin/nologin botuser
+# Каталог кеша сравнений (/cmp) принадлежит рабочему пользователю: /app создан от root.
+RUN useradd --create-home --shell /usr/sbin/nologin botuser \
+    && mkdir -p /app/var/cmp \
+    && chown -R botuser:botuser /app/var
 USER botuser
 
 CMD ["python", "-m", "bot.main"]

@@ -6,8 +6,14 @@ services:
     env_file:
       - .env
     restart: unless-stopped
+    volumes:
+      # Кеш сравнений /cmp: номера живут между перезапусками и пересборками образа.
+      - cmp-cache:/app/var/cmp
     logging:
       driver: json-file
       options:
         max-size: "10m"
         max-file: "3"
+
+volumes:
+  cmp-cache:

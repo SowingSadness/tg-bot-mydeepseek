@@ -35,6 +35,7 @@ from aiogram.types import (
     InputTextMessageContent,
 )
 
+from ..compare import inline as compare_inline
 from ..config import settings
 from ..deepseek import DeepSeekError, deepseek
 from ..respond import is_allowed
@@ -278,6 +279,10 @@ async def on_inline_query(query: InlineQuery) -> None:
             query,
             _hint("🚫 Доступ ограничен", "Этот бот принимает запросы только от разрешённых пользователей."),
         )
+        return
+
+    # "#482913" — сравнение из кеша: DeepSeek не нужен, ответ мгновенный.
+    if await compare_inline.try_answer(query):
         return
 
     text = (query.query or "").strip()
