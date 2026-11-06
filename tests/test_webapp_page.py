@@ -27,8 +27,9 @@ PAGE = PAGE_FILE.read_text(encoding="utf-8")
 TELEGRAM_SCRIPT = "https://telegram.org/js/telegram-web-app.js"
 #: Размер страницы до добавления репортёра ошибок (замер перед шагом 3), байт.
 PAGE_BYTES_BEFORE_REPORTER = 25197
-#: Репортёр не должен раздувать единственный файл страницы сильнее, чем на 3 КБ.
-PAGE_BYTES_BUDGET = PAGE_BYTES_BEFORE_REPORTER + 3 * 1024
+#: Репортёр не должен раздувать единственный файл страницы сильнее, чем на 3 КБ,
+#: плюс 1 КБ на защиту отрисовки (первый кадр, `try/catch`, отчёт `where=render`).
+PAGE_BYTES_BUDGET = PAGE_BYTES_BEFORE_REPORTER + 3 * 1024 + 1024
 
 
 @pytest.fixture
@@ -190,12 +191,121 @@ def test_page_has_explicit_error_reports(needle: str) -> None:
 
 
 def test_page_size_stays_within_reporter_budget() -> None:
-    """Репортёр — компактный: страница выросла не больше чем на 3 КБ."""
+    """Репортёр и защита отрисовки компактны: страница выросла не больше чем на 4 КБ."""
     size = PAGE_FILE.stat().st_size
     assert size <= PAGE_BYTES_BUDGET, (
-        f"cmp.html вырос до {size} байт; бюджет после репортёра — "
+        f"cmp.html вырос до {size} байт; бюджет — "
         f"{PAGE_BYTES_BUDGET} байт (до шага было {PAGE_BYTES_BEFORE_REPORTER})"
     )
+
+
+# ---------------------------------------------------------- первый кадр/отрисовка
+
+
+def page_block(start: str, end: str) -> str:
+    """Кусок страницы от `start` до ближайшего `end` после него."""
+    begin = PAGE.index(start)
+    return PAGE[begin : PAGE.index(end, begin)]
+
+
+def test_page_renders_through_workspace_and_never_calls_layout() -> None:
+    """Точка отрисовки — `workspace()`; необъявленной `layout()` в странице нет.
+
+    Регрессия: `layout()` никогда не была объявлена, `ReferenceError` летел уже
+    после `hideScreen()`, и пользователь видел пустую страницу вместо шторки.
+    """
+    assert "layout(" not in PAGE
+    assert "function workspace()" in PAGE
+    assert "function draw()" in PAGE
+
+
+def test_page_draws_first_frame_after_load_inside_try() -> None:
+    """После загрузки данных кадр рисуется в `try`, а падение уходит в отчёт.
+
+    `hideScreen()` и `workspace()` идут в одном `try`: если отрисовка упала,
+    экран загрузки не остаётся скрытым — показывается `retry` с сообщением,
+    а ошибка уходит в `/api/cmp/log` с `where='render'`. Исключение не
+    выбрасывается дальше, чтобы не попасть в ветку «Нет связи».
+    """
+    load_body = page_block(
+        "function load()", "// ------------------------------------------------------------- канвас/кадры"
+    )
+    assert re.search(r"try\s*\{\s*hideScreen\(\);\s*workspace\(\);", load_body), (
+        "после загрузки данных нужен `hideScreen(); workspace();`"
+    )
+    render_catch = re.search(r"catch\s*\(err\)\s*\{([^}]*)\}", load_body)
+    assert render_catch is not None, "падение отрисовки должно ловиться"
+    assert "report('error', err, 'render')" in render_catch.group(1)
+    assert re.search(r"showScreen\(\s*'retry',\s*'Не удалось отрисовать'", load_body)
+    assert "throw" not in render_catch.group(1)
+
+
+def test_page_redraws_on_resize_and_theme_change() -> None:
+    """Кадр перерисовывается при ресайзе и смене темы, а не только один раз."""
+    on_resize = page_block("function onResize()", "window.addEventListener('resize', onResize)")
+    assert "workspace()" in on_resize
+    assert "draw()" in PAGE  # workspace() -> draw()
+    assert "window.addEventListener('resize', onResize)" in PAGE
+    assert "window.addEventListener('orientationchange', onResize)" in PAGE
+    assert "new ResizeObserver(onResize)" in PAGE
+
+    apply_theme = page_block(
+        "function applyTheme()", "// ----------------------------------------------------------- экраны статуса"
+    )
+    assert "draw()" in apply_theme
+    assert "tg.onEvent('themeChanged', applyTheme)" in PAGE
+
+
+def test_page_calls_only_declared_functions() -> None:
+    """Каждый вызов `name(` — объявленная функция/переменная или браузерный глобал.
+
+    Общий тест на класс ошибки «вызвали несуществующую функцию» (как `layout()`):
+    строки и комментарии вырезаны, поэтому упоминание в тексте не спасает.
+    """
+    script = PAGE.split("<script>", 1)[1].rsplit("</script>", 1)[0]
+    code = re.sub(r"'(?:[^'\\\n]|\\.)*'", "''", script)
+    code = re.sub(r'"(?:[^"\\\n]|\\.)*"', '""', code)
+    code = re.sub(r"//[^\n]*", "", code)
+
+    declared = set(re.findall(r"function\s+([A-Za-z_$][\w$]*)\s*\(", code))
+    declared |= {
+        name.strip().split("=")[0].strip()
+        for params in re.findall(r"function\s*[A-Za-z_$\w]*\s*\(([^)]*)\)", code)
+        for name in params.split(",")
+        if name.strip()
+    }
+    called = set(re.findall(r"(?<![\w$.])([A-Za-z_$][\w$]*)\s*\(", code))
+    browser_globals = {
+        "Error",
+        "Image",
+        "Map",
+        "Number",
+        "Promise",
+        "ResizeObserver",
+        "Set",
+        "String",
+        "URLSearchParams",
+        "clearTimeout",
+        "setTimeout",
+        "fetch",
+        "encodeURIComponent",
+        # Ключевые слова и конструкции, которые regex принимает за вызов.
+        "catch",
+        "do",
+        "else",
+        "for",
+        "function",
+        "if",
+        "new",
+        "return",
+        "switch",
+        "throw",
+        "try",
+        "typeof",
+        "var",
+        "while",
+    }
+    assert called - declared - browser_globals == set()
 
 
 def test_error_reporter_adds_no_external_resources() -> None:

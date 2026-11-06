@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from contextlib import suppress
 from pathlib import Path
 
@@ -28,6 +29,9 @@ log = logging.getLogger(__name__)
 
 #: Как часто фоновая задача чистит кеш сравнений по TTL и по числу записей.
 COMPARE_PURGE_INTERVAL = 6 * 3600
+
+#: Апдейт, обработка которого заняла не меньше этого, попадает в WARNING.
+SLOW_UPDATE_SECONDS = 3.0
 
 #: Статика мини-аппа лежит в пакете (`COPY bot ./bot` в Dockerfile её захватывает).
 WEBAPP_STATIC_DIR = Path(__file__).resolve().parent / "webapp" / "static"
@@ -67,15 +71,28 @@ def build_dispatcher() -> Dispatcher:
 
     @dispatcher.update.outer_middleware()
     async def _log_update(handler, event, data):  # noqa: ANN001
-        """DEBUG-лог входящего апдейта; на уровне ERROR ничего не пишет."""
+        """INFO/DEBUG-строка об апдейте, WARNING для медленных, ERROR для упавших."""
+        update_id = getattr(event, "update_id", "?")
         try:
             # `describe_update` собирает строку небесплатно (redact/регекспы), поэтому
-            # вызываем его только когда DEBUG реально включён для нашего логгера.
+            # вызываем каждую форму только когда её уровень реально включён.
+            if log.isEnabledFor(logging.INFO):
+                log.info("%s", describe_update(event))
             if log.isEnabledFor(logging.DEBUG):
-                log.debug("%s", describe_update(event))
+                log.debug("%s", describe_update(event, verbose=True))
         except Exception:  # noqa: BLE001 — лог не должен ломать обработку
             log.debug("Не удалось описать входящий апдейт", exc_info=True)
-        return await handler(event, data)
+
+        started = time.perf_counter()
+        try:
+            return await handler(event, data)
+        except Exception:
+            log.error("update %s: обработчик упал", update_id, exc_info=True)
+            raise
+        finally:
+            elapsed = time.perf_counter() - started
+            if elapsed >= SLOW_UPDATE_SECONDS:
+                log.warning("update %s: slow %.1fs", update_id, elapsed)
 
     @dispatcher.callback_query()
     async def _answer_any_callback(callback) -> None:  # noqa: ANN001
@@ -165,7 +182,10 @@ async def setup_webapp() -> web.AppRunner | None:
         share_by_id=settings.cmp_share_by_id,
         static_dir=WEBAPP_STATIC_DIR,
     )
-    # access_log=None: в URL мини-аппа лежит `startapp`-токен, его нельзя писать в лог.
+    # access_log=None: "сырой" access-log aiohttp не редактирует URL вообще, поэтому
+    # `startapp`-токен попал бы в лог мимо нашего middleware. Свою строку запроса
+    # пишет `webapp/api.py`, и это единственное место, где токен ссылки остаётся
+    # видимым (по требованию заказчика); `init_data`/`tgWebAppData` скрыты везде.
     runner = web.AppRunner(app, access_log=None)
     await runner.setup()
     try:

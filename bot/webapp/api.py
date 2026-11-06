@@ -20,11 +20,14 @@
 * ``POST /api/cmp/log`` → 204, если клиентский отчёт об ошибке принят; 403 при
   битом/отсутствующем токене, 400 для пустого/не-JSON ``message``, 413 для
   сообщения длиннее 500 символов или тела больше 8 КБ; не больше 30 отчётов
-  в минуту на токен (лишние тихо отбрасываются с тем же 204); ``message`` и
-  ``where`` схлопываются в одну строку и проходят ``redact()``;
-* каждый запрос даёт ровно одну строку лога (`INFO` < 400, `WARNING` 4xx,
-  `ERROR` 5xx) с замаскированным токеном — это делает middleware
-  `log_requests`, а не `access_log` (он остаётся `None`).
+  в минуту на токен (лишние отбрасываются с тем же 204 и одной `WARNING`-строкой
+  в логе); ``message`` и ``where`` схлопываются в одну строку и проходят
+  ``redact()``;
+* каждый запрос даёт ровно одну строку лога `<status> <METHOD> <url> — <N> мс`
+  (`INFO` < 400, `WARNING` 4xx, `ERROR` 5xx), а `POST /api/cmp/log` — всегда
+  `ERROR`, даже при `204`, плюс `cmp=`/`user=`, когда известны; токен
+  `startapp` в URL виден по требованию заказчика, `init_data` — нет. Это делает
+  middleware `log_requests`, а не `access_log` (он остаётся `None`).
 
 Безопасность: значение ``side`` допускается только ``a``/``b``, номер
 сравнения берётся из проверенной подписи (только цифры), путь к файлу строится
@@ -68,6 +71,8 @@ CLIENT_LOG_MAX_BODY = 8 * 1024
 CLIENT_LOG_MAX_MESSAGE = 500
 #: Максимальная длина поля `where` в символах.
 CLIENT_LOG_MAX_WHERE = 100
+#: Путь клиентских отчётов: его middleware всегда пишет на `ERROR`.
+CLIENT_LOG_PATH = "/api/cmp/log"
 #: Лимит клиентских отчётов в минуту на один токен.
 CLIENT_LOG_LIMIT = 30
 #: Окно лимита в секундах.
@@ -157,10 +162,15 @@ def _image_headers(content_type: str, etag: str) -> dict[str, str]:
 async def log_requests(request: web.Request, handler) -> web.StreamResponse:
     """Одна строка о каждом запросе мини-аппа, в том числе об ошибке.
 
-    Путь и query проходят через `describe_webapp_request` → `redact_url`,
-    поэтому `startapp`-токен и `init_data` в лог не попадают. Статус берётся
-    из ответа, а для `web.HTTPException` — из исключения; само исключение
-    пробрасывается дальше без изменений.
+    Путь и query проходят через `describe_webapp_request` → `redact_request_url`:
+    `init_data` в лог не попадает, а токен `startapp` виден по требованию
+    заказчика. Статус берётся из ответа, а для `web.HTTPException` — из
+    исключения; само исключение пробрасывается дальше без изменений.
+
+    Уровень обычных запросов — по статусу (`INFO` < 400, `WARNING` 4xx,
+    `ERROR` 5xx). Клиентский отчёт `POST /api/cmp/log` — это доставка ошибки
+    со страницы, поэтому он пишется на `ERROR` даже при пустом `204`; номер
+    сравнения и пользователь добавляются суффиксами `cmp=`/`user=`.
     """
     started = time.perf_counter()
     status = 500
@@ -176,23 +186,33 @@ async def log_requests(request: web.Request, handler) -> web.StreamResponse:
         raise
     finally:
         elapsed_ms = (time.perf_counter() - started) * 1000
-        if status < 400:
+        is_client_log = request.method == "POST" and request.path == CLIENT_LOG_PATH
+        if is_client_log:
+            # Отчёт об ошибке со страницы: сам факт отчёта — уже ERROR.
+            level = logging.ERROR
+        elif status < 400:
             level = logging.INFO
         elif status < 500:
             level = logging.WARNING
         else:
             level = logging.ERROR
-        log.log(
-            level,
-            "%s",
-            describe_webapp_request(
-                request.method,
-                request.path_qs,
-                status,
-                elapsed_ms,
-                user_id=request.get("webapp_user_id"),
-            ),
+        user_id = request.get("webapp_user_id")
+        # Для отчёта `user=` дописываем вместе с `cmp=` ниже, чтобы порядок
+        # суффиксов был `… — N мс cmp=<id> user=<id>`.
+        line = describe_webapp_request(
+            request.method,
+            request.path_qs,
+            status,
+            elapsed_ms,
+            user_id=None if is_client_log else user_id,
         )
+        if is_client_log:
+            cmp_id = request.get("webapp_cmp_id")
+            if cmp_id is not None:
+                line += f" cmp={cmp_id}"
+            if user_id is not None:
+                line += f" user={user_id}"
+        log.log(level, "%s", line)
 
 
 def build_webapp_app(
@@ -251,7 +271,7 @@ def build_webapp_app(
         try:
             cached = await store.get(cmp_id)
         except Exception:  # noqa: BLE001 — клиенту нужен код, а не трейсбек
-            log.exception("Не удалось прочитать сравнение из кеша")
+            log.exception("Не удалось прочитать сравнение #%s из кеша", cmp_id)
             return _error(500, "Кеш сравнений недоступен")
         if cached is None:
             return _error(404, "Сравнение не найдено")
@@ -318,7 +338,8 @@ def build_webapp_app(
 
         Токен обязателен и проверяется подписью: без него в лог не пишется
         ничего. `url` (страница, где случилась ошибка) намеренно не логируем.
-        Лимит — 30 отчётов в минуту на токен, сверх — тихий `204`.
+        Лимит — 30 отчётов в минуту на токен, сверх — `204` клиенту и одна
+        `WARNING`-строка о том, что отчёт отброшен (тело отчёта не пишется).
         """
         try:
             data = await request.json()
@@ -333,6 +354,8 @@ def build_webapp_app(
         cmp_id = webauth.verify(raw_token) if isinstance(raw_token, str) else None
         if cmp_id is None:
             return _error(403, "Ссылка недействительна")
+        # Для middleware: `cmp=<id>` в строке запроса и в отчёте.
+        request["webapp_cmp_id"] = cmp_id
 
         message = data.get("message")
         if not isinstance(message, str) or not message.strip():
@@ -362,6 +385,16 @@ def build_webapp_app(
         ]
         if len(recent) >= CLIENT_LOG_LIMIT:
             client_logs[key] = recent
+            # Клиенту по контракту всё равно 204, но отброшенный отчёт не должен
+            # исчезать бесследно. Тело сообщения здесь не пишем: строка короткая
+            # и без секретов, `where` уже прошёл `_client_text`.
+            log.warning(
+                "webapp[client] cmp=%s отчёт отброшен (лимит %d/мин, окно %d с) where=%s",
+                cmp_id,
+                CLIENT_LOG_LIMIT,
+                int(CLIENT_LOG_WINDOW),
+                where or "-",
+            )
             return web.Response(status=204)
         recent.append(now)
         client_logs[key] = recent
@@ -393,7 +426,7 @@ def build_webapp_app(
     app.middlewares.append(log_requests)
     app.router.add_get("/healthz", healthz)
     app.router.add_get("/api/cmp/{token}", comparison)
-    app.router.add_post("/api/cmp/log", client_log)
+    app.router.add_post(CLIENT_LOG_PATH, client_log)
     app.router.add_get("/app/cmp/img/{token}/{side}", image)
     app.router.add_get("/app/cmp", page)
     app.router.add_get("/app/cmp/", page)

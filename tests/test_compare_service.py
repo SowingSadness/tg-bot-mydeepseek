@@ -599,6 +599,44 @@ async def test_compare_urls_error_reports_and_saves_nothing(env, monkeypatch):
     assert not _widgets(env.calls)
 
 
+@pytest.mark.parametrize("query_key", ["startapp", "tgWebAppStartParam"])
+async def test_compare_urls_failure_log_masks_startapp_token(
+    env, monkeypatch, caplog, query_key
+):
+    """URL с токеном в логе замаскирован, а ответ и побочные эффекты — как раньше."""
+    token = "337326_AbCdEfGhIjKlMnOpQrSt"
+    url = f"https://t.me/cmpbot?{query_key}={token}"
+
+    async def fake_download(session, url, *, max_bytes, timeout, allow_private):
+        raise RuntimeError(f"connection reset: {url}")
+
+    monkeypatch.setattr(images, "download_url", fake_download)
+    message = FakeMessage(env.calls)
+    with caplog.at_level(logging.INFO, logger=service.log.name):
+        await service.compare_urls(message, [url, "https://b.test/two.jpg"])
+
+    lines = [
+        record.getMessage()
+        for record in caplog.records
+        if record.name == service.log.name
+    ]
+    assert len(lines) == 1, caplog.text
+    line = lines[0]
+    assert token not in line
+    assert f"{query_key}=<redacted>" in line
+    assert "https://t.me/cmpbot" in line
+    assert "\n" not in line
+    assert [rec.levelno for rec in caplog.records if rec.name == service.log.name] == [
+        logging.INFO
+    ]
+
+    assert message.answers == [
+        "Не удалось скачать картинку по ссылке, попробуйте ещё раз."
+    ]
+    assert not _saves(env.calls)
+    assert not _widgets(env.calls)
+
+
 async def test_non_image_document_with_cmp_caption_reports_and_keeps_no_state(env):
     message = FakeMessage(
         env.calls,
@@ -672,17 +710,20 @@ async def test_originals_failure_warns_and_keeps_widget_hint_and_preview(env, ca
         await service.compare_images(message, PNG_A, PNG_B)
 
     assert "оригинал" in caplog.text and "disk full" in caplog.text
+    assert f"#{CMP_ID}" in caplog.text
     assert len(_widgets(env.calls)) == 1
     assert message.answers == ["Номер сравнения: #482913\n@test_bot #482913"]
     assert len(_by_name(env.calls, "bot.send_photo")) == 1
     assert _by_name(env.calls, "store.set_preview_file_id")
 
 
-async def test_widget_api_error_falls_back_to_album_and_reports_id(env):
+async def test_widget_api_error_falls_back_to_album_and_reports_id(env, caplog):
     env.api.error = WidgetAPIError(400, "INPUT_MEDIA_WIDGET_NOT_ALLOWED")
     message = FakeMessage(env.calls)
-    await service.compare_images(message, PNG_A, PNG_B)
+    with caplog.at_level(logging.WARNING, logger=service.log.name):
+        await service.compare_images(message, PNG_A, PNG_B)
 
+    assert f"cmp=#{CMP_ID}" in caplog.text
     assert len(_saves(env.calls)) == 1
     assert len(message.media_groups) == 1
     media = message.media_groups[0]
@@ -690,15 +731,28 @@ async def test_widget_api_error_falls_back_to_album_and_reports_id(env):
     assert any(f"#{CMP_ID}" in answer for answer in message.answers)
 
 
-async def test_widget_too_large_reports_text_and_saves_nothing(env, monkeypatch):
+async def test_widget_too_large_reports_text_and_saves_nothing(env, monkeypatch, caplog):
     def boom(*args, **kwargs):
         raise build.WidgetTooLarge
 
     monkeypatch.setattr(build, "build", boom)
     message = FakeMessage(env.calls)
-    await service.compare_images(message, PNG_A, PNG_B)
+    with caplog.at_level(logging.WARNING, logger=service.log.name):
+        await service.compare_images(message, PNG_A, PNG_B)
 
+    # Пользователю — прежний текст, в лог — WARNING с контекстом и честной пометкой,
+    # что номер сравнения ещё не присвоен (кеш пишется только после сборки).
     assert message.answers == [service.TOO_LARGE_TEXT]
+    warnings = [
+        record.getMessage()
+        for record in caplog.records
+        if record.levelno == logging.WARNING
+    ]
+    assert len(warnings) == 1, caplog.text
+    assert f"chat={CHAT_ID}" in warnings[0]
+    assert f"user={USER_ID}" in warnings[0]
+    assert "cmp=<не присвоен>" in warnings[0]
+    assert "не уложился" in warnings[0]
     assert not _saves(env.calls)
     assert not _widgets(env.calls)
 
@@ -742,6 +796,7 @@ async def test_preview_send_failure_warns_and_keeps_widget_and_hint(env, caplog)
         await service.compare_images(message, PNG_A, PNG_B)
 
     assert "превью" in caplog.text and "network down" in caplog.text
+    assert f"#{CMP_ID}" in caplog.text
     assert len(_widgets(env.calls)) == 1
     assert any(f"#{CMP_ID}" in answer for answer in message.answers)
     assert not _by_name(env.calls, "store.set_preview_file_id")
@@ -757,6 +812,7 @@ async def test_preview_delete_failure_warns_and_does_not_save_file_id(env, caplo
         await service.compare_images(message, PNG_A, PNG_B)
 
     assert "превью" in caplog.text and "delete" in caplog.text.lower()
+    assert f"#{CMP_ID}" in caplog.text
     assert len(_widgets(env.calls)) == 1
     assert any(f"#{CMP_ID}" in answer for answer in message.answers)
     assert not _by_name(env.calls, "store.set_preview_file_id")
@@ -781,6 +837,36 @@ async def test_not_an_image_reports_text_and_saves_nothing(env):
 
     assert len(message.answers) == 1
     assert "картинка" in message.answers[0].lower()
+    assert not _saves(env.calls)
+    assert not _widgets(env.calls)
+
+
+async def test_image_error_warns_with_context_and_keeps_user_text(
+    env, monkeypatch, caplog
+):
+    """`images.ImageError` в сборке: WARNING с chat/user/причиной, ответ прежний."""
+
+    def boom(_data):
+        raise images.ImageError("картинка битая")
+
+    monkeypatch.setattr(service.images, "load", boom)
+    message = FakeMessage(env.calls)
+    with caplog.at_level(logging.WARNING, logger=service.log.name):
+        await service.compare_images(message, PNG_A, PNG_B)
+
+    assert message.answers == ["картинка битая"]
+    warnings = [
+        record.getMessage()
+        for record in caplog.records
+        if record.levelno == logging.WARNING
+    ]
+    assert len(warnings) == 1, caplog.text
+    line = warnings[0]
+    assert f"chat={CHAT_ID}" in line
+    assert f"user={USER_ID}" in line
+    assert "картинка битая" in line
+    assert "cmp=<не присвоен>" in line
+    assert "\n" not in line
     assert not _saves(env.calls)
     assert not _widgets(env.calls)
 

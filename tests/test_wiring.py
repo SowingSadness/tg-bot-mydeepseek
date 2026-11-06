@@ -106,41 +106,141 @@ def test_compare_router_goes_before_private() -> None:
     ]
 
 
-async def test_update_middleware_logs_and_calls_handler(caplog) -> None:
-    """DEBUG-лог апдейта не заменяет обработчик и не падает на его вызове."""
+def _middleware():
+    """Внешний middleware `_log_update` с собранного диспетчера."""
     dispatcher = _dispatcher()
-    middleware = next(
+    return next(
         item
         for item in dispatcher.update.outer_middleware
         if getattr(item, "__name__", "") == "_log_update"
     )
 
+
+def _update_event(**overrides) -> SimpleNamespace:
+    """Минимальный апдейт: по умолчанию текстовое сообщение с update_id=5."""
+    message = {
+        "chat": SimpleNamespace(id=777, type="private"),
+        "from_user": SimpleNamespace(id=42, username="tester"),
+        "message_id": 1,
+        "text": "привет",
+        "caption": None,
+        "photo": None,
+        "document": None,
+        "media_group_id": None,
+    }
+    message.update(overrides)
+    return SimpleNamespace(
+        update_id=5, event_type="message", message=SimpleNamespace(**message)
+    )
+
+
+def _records(caplog, level: int) -> list[logging.LogRecord]:
+    return [record for record in caplog.records if record.levelno == level]
+
+
+async def test_update_middleware_logs_compact_info(caplog) -> None:
+    """INFO — одна компактная строка: контекст и текст, без `file_id`."""
+    middleware = _middleware()
     seen: list[tuple] = []
 
     async def handler(event, data):  # noqa: ANN001
         seen.append((event, data))
         return "handled"
 
-    event = SimpleNamespace(
-        event_type="message",
-        message=SimpleNamespace(
-            chat=SimpleNamespace(id=777, type="private"),
-            from_user=SimpleNamespace(id=42, username="tester"),
-            message_id=1,
-            text="привет",
-            caption=None,
-            photo=None,
-            document=None,
-            media_group_id=None,
-        ),
-    )
+    event = _update_event()
+    with caplog.at_level(logging.INFO, logger=main_module.log.name):
+        assert await middleware(handler, event, {"bot": None}) == "handled"
 
-    caplog.set_level(logging.DEBUG)
-    assert await middleware(handler, event, {"bot": None}) == "handled"
     assert seen and seen[0][0] is event
-    assert "chat_id=777" in caplog.text
-    assert "user_id=42" in caplog.text
-    assert "text='привет'" in caplog.text
+    info = _records(caplog, logging.INFO)
+    assert len(info) == 1, caplog.text
+    line = info[0].getMessage()
+    assert "update=message" in line
+    assert "chat_id=777" in line
+    assert "chat_type=private" in line
+    assert "user_id=42" in line
+    assert "text='привет'" in line
+    assert "file_id" not in line
+    assert "\n" not in line
+
+
+async def test_update_middleware_logs_verbose_debug(caplog) -> None:
+    """DEBUG дополнительно печатает `file_id`, размер и `media_group_id`."""
+    middleware = _middleware()
+
+    async def handler(event, data):  # noqa: ANN001
+        return "handled"
+
+    photo = SimpleNamespace(
+        file_id="file-photo", width=100, height=80, file_size=12345
+    )
+    event = _update_event(photo=[photo], media_group_id="album-1")
+    with caplog.at_level(logging.DEBUG, logger=main_module.log.name):
+        assert await middleware(handler, event, {}) == "handled"
+
+    debug = _records(caplog, logging.DEBUG)
+    assert debug, caplog.text
+    line = debug[-1].getMessage()
+    assert "media=photo" in line
+    assert "file_id=file-photo" in line
+    assert "size=100x80" in line
+    assert "bytes=12345" in line
+    assert "media_group_id=album-1" in line
+    # INFO-строка тоже есть, но без медиа-деталей.
+    info = _records(caplog, logging.INFO)
+    assert info and "file_id" not in info[0].getMessage()
+    assert "\n" not in line
+    assert "\n" not in info[0].getMessage()
+
+
+async def test_update_middleware_warns_about_slow_update(caplog, monkeypatch) -> None:
+    """Апдейт дольше 3 c — `WARNING update <id>: slow <N>s`, без текста сообщения."""
+    middleware = _middleware()
+    ticks = iter([100.0, 104.2])
+    monkeypatch.setattr(main_module.time, "perf_counter", lambda: next(ticks))
+
+    async def handler(event, data):  # noqa: ANN001
+        return "handled"
+
+    with caplog.at_level(logging.WARNING, logger=main_module.log.name):
+        assert await middleware(handler, _update_event(), {}) == "handled"
+
+    warnings = _records(caplog, logging.WARNING)
+    assert [record.getMessage() for record in warnings] == ["update 5: slow 4.2s"]
+    assert "привет" not in caplog.text
+
+
+async def test_update_middleware_fast_update_is_not_slow(caplog, monkeypatch) -> None:
+    """Быстрый апдейт под порог 3 c не даёт WARNING."""
+    middleware = _middleware()
+    ticks = iter([100.0, 102.9])
+    monkeypatch.setattr(main_module.time, "perf_counter", lambda: next(ticks))
+
+    async def handler(event, data):  # noqa: ANN001
+        return "handled"
+
+    with caplog.at_level(logging.WARNING, logger=main_module.log.name):
+        assert await middleware(handler, _update_event(), {}) == "handled"
+
+    assert _records(caplog, logging.WARNING) == []
+
+
+async def test_update_middleware_logs_crash_and_reraises(caplog) -> None:
+    """Исключение в хендлере — `ERROR` с `exc_info`, и оно не проглатывается."""
+    middleware = _middleware()
+
+    async def handler(event, data):  # noqa: ANN001
+        raise ValueError("boom")
+
+    with caplog.at_level(logging.ERROR, logger=main_module.log.name):
+        with pytest.raises(ValueError, match="boom"):
+            await middleware(handler, _update_event(), {})
+
+    errors = _records(caplog, logging.ERROR)
+    assert len(errors) == 1, caplog.text
+    assert errors[0].getMessage() == "update 5: обработчик упал"
+    assert errors[0].exc_info is not None
+    assert "ValueError: boom" in caplog.text
 
 
 def test_commands_include_cmp() -> None:

@@ -32,6 +32,7 @@ MIN_DATA_URI = 64
 #: Чувствительные query-параметры мини-аппа: их значения в лог не попадают.
 _SENSITIVE_QUERY_KEYS: tuple[str, ...] = (
     "tgWebAppData",
+    "tgWebAppStartParam",
     "init_data",
     "startapp",
     "hash",
@@ -42,6 +43,18 @@ _SENSITIVE_QUERY_KEYS: tuple[str, ...] = (
 _SENSITIVE_QUERY_RE = re.compile(
     r"(?i)(?P<sep>^|[?&#])(?P<key>"
     + "|".join(_SENSITIVE_QUERY_KEYS)
+    + r")=[^&#]*"
+)
+
+#: В строке запроса мини-аппа скрываются только сами данные пользователя
+#: (`init_data`/`tgWebAppData`). Токены `startapp`/`t` там остаются видимыми:
+#: это единственное место, где по логу можно разобрать сломанную ссылку.
+_ALWAYS_HIDDEN_QUERY_KEYS: tuple[str, ...] = ("tgWebAppData", "init_data")
+
+#: `key=value` только для `init_data`/`tgWebAppData` в query/фрагменте.
+_ALWAYS_HIDDEN_QUERY_RE = re.compile(
+    r"(?i)(?P<sep>^|[?&#])(?P<key>"
+    + "|".join(_ALWAYS_HIDDEN_QUERY_KEYS)
     + r")=[^&#]*"
 )
 
@@ -157,9 +170,10 @@ def _shrink_data_uri(match: re.Match[str]) -> str:
 def redact_url(path_with_query: str) -> str:
     """Маскирует токены мини-аппа в пути и query-строке, не ломая остальное.
 
-    Значения параметров `t`, `init_data`, `startapp`, `tgWebAppData`, `hash`
-    заменяются на `<redacted>`, сегмент-токен после `/app/cmp/img/` (и
-    `/api/cmp/`) — на `<token>`. Остальные параметры и их порядок сохраняются.
+    Значения параметров `t`, `init_data`, `startapp`, `tgWebAppStartParam`,
+    `tgWebAppData`, `hash` заменяются на `<redacted>`, сегмент-токен после
+    `/app/cmp/img/` (и `/api/cmp/`) — на `<token>`. Остальные параметры и их
+    порядок сохраняются.
     В конце применяется `redact()` — на случай токена бота или `data:`-URI.
 
     Никогда не бросает исключений: `None` → `""`, а строки без `/` и `?`
@@ -190,6 +204,37 @@ def _mask_query_value(match: re.Match[str]) -> str:
     return f"{match.group('sep')}{match.group('key')}=<redacted>"
 
 
+def redact_request_url(path_with_query: str) -> str:
+    """URL для строки запроса: токены `startapp` видны, `init_data` — `<скрыто>`.
+
+    Заказчик просит видеть в строке запроса полный URL: это единственное место,
+    где по логу можно понять, какая именно ссылка пришла и почему она сломалась,
+    поэтому, в отличие от `redact_url`, сегмент-токены (`/api/cmp/<token>`,
+    `/app/cmp/img/<token>/…`) и параметры `t`/`startapp`/`tgWebAppStartParam`
+    здесь **не** маскируются. Скрывается всегда только `init_data` и
+    `tgWebAppData`: это подписанные данные пользователя, им не место в логе.
+
+    Строка не урезается, остальные параметры и их порядок сохраняются. В конце
+    применяется `redact()` — на случай токена бота или `data:`-URI. Никогда не
+    бросает исключений: `None` → `""`.
+    """
+    if path_with_query is None:
+        return ""
+    try:
+        value = str(path_with_query)
+    except Exception:  # noqa: BLE001 — лог не имеет права падать
+        return ""
+    try:
+        value = _ALWAYS_HIDDEN_QUERY_RE.sub(_hide_query_value, value)
+        return redact(value)
+    except Exception:  # noqa: BLE001
+        return redact(value) if isinstance(value, str) else ""
+
+
+def _hide_query_value(match: re.Match[str]) -> str:
+    return f"{match.group('sep')}{match.group('key')}=<скрыто>"
+
+
 def describe_webapp_request(
     method: str,
     path: str,
@@ -198,24 +243,32 @@ def describe_webapp_request(
     *,
     user_id: int | None = None,
 ) -> str:
-    """Одна строка о запросе к мини-аппу: `webapp GET /api/cmp/<token> 200 12ms`.
+    """Одна строка о запросе к мини-аппу: `200 GET /api/cmp/<token> — 12 мс`.
 
-    `user_id` добавляется только когда известен (валидный `initData`); путь
-    проходит через `redact_url`, поэтому токен в лог не попадает.
+    Статус идёт первым (удобно фильтровать), метод — заглавными, URL — полностью
+    через `redact_request_url`: токен `startapp` виден по требованию заказчика,
+    скрывается только `init_data`/`tgWebAppData`. `user_id` добавляется, когда
+    известен (валидный `initData`). Никогда не бросает исключений: `None`/мусор
+    во входных данных дают безопасную строку, а не падение запроса.
     """
     try:
-        parts = [
-            "webapp",
-            _one_line(str(method or "?").upper(), 16),
-            redact_url(path),
-            str(status),
-            f"{max(0, int(float(ms) + 0.5))}ms",
-        ]
+        method_text = _one_line(str(method or "?").upper(), 16) or "?"
+        try:
+            status_text = str(int(status))
+        except Exception:  # noqa: BLE001 — статус может быть None/объектом
+            status_text = "?" if status is None else _one_line(status, 16)
+        try:
+            elapsed = max(0, int(float(ms) + 0.5))
+        except Exception:  # noqa: BLE001 — длительность не должна ронять лог
+            elapsed = 0
+        url_text = redact_request_url(path)
+        parts = [status_text, method_text, url_text, f"— {elapsed} мс"]
         if user_id is not None:
             parts.append(f"user={user_id}")
-        return _one_line(redact(" ".join(parts)), limit=1000)
+        # URL не урезаем: 8192 — заведомо больше лимита строки запроса aiohttp.
+        return _one_line(redact(" ".join(parts)), limit=8192)
     except Exception:  # noqa: BLE001 — лог не имеет права падать
-        return "webapp (не удалось разобрать запрос)"
+        return "(не удалось разобрать запрос)"
 
 
 # --------------------------------------------------------------------- helpers
@@ -227,6 +280,16 @@ def _one_line(value: Any, limit: int = MAX_TEXT) -> str:
     if len(text) > limit:
         text = text[: max(0, limit - 1)] + "…"
     return text
+
+
+def _safe_text(value: Any) -> str:
+    """Текст пользователя без секретов: токен бота/base64 и токены ссылок.
+
+    `redact_url` убирает `startapp`/`t`/`init_data` из вставленных в текст ссылок
+    (апдейты и их тексты — не место для capability-токенов), `redact` — токен
+    бота и длинные base64 даже в строках без `/` и `?`.
+    """
+    return _one_line(redact(redact_url(value)))
 
 
 def _enum_value(value: Any) -> Any:
@@ -292,41 +355,54 @@ def _update_user(update: Any) -> Any:
     return None
 
 
-def _describe_media(message: Any) -> str:
-    """`photo`/`document` с file_id и размером; для альбома — так же."""
+def _describe_media(message: Any, *, verbose: bool = False) -> str:
+    """`photo`/`document`: тип всегда, `file_id` и размеры — только в verbose.
+
+    Компактный режим идёт на уровне `INFO`, поэтому `file_id`/`bytes`/`size`
+    в нём не печатаются: это дорого и шумно, а в `DEBUG` они есть.
+    """
     photos = _field(message, "photo")
     if isinstance(photos, (list, tuple)) and photos:
         photo = photos[-1]
-        parts = [f"media=photo file_id={_field(photo, 'file_id', '?')}"]
-        width, height = _field(photo, "width"), _field(photo, "height")
-        if width and height:
-            parts.append(f"size={width}x{height}")
-        file_size = _field(photo, "file_size")
-        if file_size:
-            parts.append(f"bytes={file_size}")
+        parts = ["media=photo"]
+        if verbose:
+            parts.append(f"file_id={_field(photo, 'file_id', '?')}")
+            width, height = _field(photo, "width"), _field(photo, "height")
+            if width and height:
+                parts.append(f"size={width}x{height}")
+            file_size = _field(photo, "file_size")
+            if file_size:
+                parts.append(f"bytes={file_size}")
         return " ".join(parts)
 
     document = _field(message, "document")
     if document is not None:
-        parts = [f"media=document file_id={_field(document, 'file_id', '?')}"]
+        parts = ["media=document"]
+        if verbose:
+            parts.append(f"file_id={_field(document, 'file_id', '?')}")
         name = _field(document, "file_name")
         if name:
             parts.append(f"name={_one_line(name, 64)!r}")
         mime = _field(document, "mime_type")
         if mime:
             parts.append(f"mime={mime}")
-        file_size = _field(document, "file_size")
-        if file_size:
-            parts.append(f"bytes={file_size}")
+        if verbose:
+            file_size = _field(document, "file_size")
+            if file_size:
+                parts.append(f"bytes={file_size}")
         return " ".join(parts)
     return ""
 
 
-def describe_update(update: Any) -> str:
-    """Одна строка для DEBUG: тип, чат, пользователь, текст/подпись, медиа.
+def describe_update(update: Any, *, verbose: bool = False) -> str:
+    """Одна строка об апдейте: компактно для `INFO`, с медиа-деталями для `DEBUG`.
 
-    Никогда не бросает исключений: любые неожиданные/частичные объекты дают
-    строку с именем класса вместо падения обработки апдейта.
+    `verbose=False` (по умолчанию) не печатает `file_id`, байты/размеры и
+    `media_group_id` — такую строку не стыдно писать на `INFO`. `verbose=True`
+    (только при включённом `DEBUG`) добавляет эти подробности. Оба режима
+    проходят через `redact()`/`_one_line()`; функция никогда не бросает
+    исключений: любые неожиданные/частичные объекты дают строку с именем
+    класса вместо падения обработки апдейта.
     """
     try:
         parts = [f"update={_update_kind(update)}"]
@@ -354,26 +430,27 @@ def describe_update(update: Any) -> str:
             text = _field(message, "text")
             caption = _field(message, "caption")
             if text:
-                parts.append(f"text={_one_line(redact(text))!r}")
+                parts.append(f"text={_safe_text(text)!r}")
             if caption:
-                parts.append(f"caption={_one_line(redact(caption))!r}")
-            media = _describe_media(message)
+                parts.append(f"caption={_safe_text(caption)!r}")
+            media = _describe_media(message, verbose=verbose)
             if media:
                 parts.append(media)
-            media_group_id = _field(message, "media_group_id")
-            if media_group_id:
-                parts.append(f"media_group_id={media_group_id}")
+            if verbose:
+                media_group_id = _field(message, "media_group_id")
+                if media_group_id:
+                    parts.append(f"media_group_id={media_group_id}")
         else:
             inline = _field(update, "inline_query")
             if inline is not None:
                 query = _field(inline, "query")
                 if query:
-                    parts.append(f"query={_one_line(redact(query))!r}")
+                    parts.append(f"query={_safe_text(query)!r}")
             callback = _field(update, "callback_query")
             if callback is not None:
                 data = _field(callback, "data")
                 if data:
-                    parts.append(f"callback_data={_one_line(redact(data))!r}")
+                    parts.append(f"callback_data={_safe_text(data)!r}")
 
         return _one_line(redact(" ".join(parts)), limit=1000)
     except Exception:  # noqa: BLE001 — лог не имеет права ломать обработку
@@ -459,6 +536,7 @@ __all__ = [
     "describe_update",
     "describe_webapp_request",
     "redact",
+    "redact_request_url",
     "redact_url",
     "setup_logging",
 ]

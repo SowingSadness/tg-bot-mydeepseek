@@ -30,6 +30,7 @@ from aiogram.types import BufferedInputFile, InputMediaDocument
 
 from .. import respond
 from ..config import settings
+from ..logging_setup import _one_line, redact_url
 from . import api as api_module
 from . import build, images, originals, preview
 from .store import ComparisonStore
@@ -120,6 +121,18 @@ def _album_key(message) -> AlbumKey:
     """Альбом опознаётся по `media_group_id`, одиночное сообщение — по `message_id`."""
     group = getattr(message, "media_group_id", None)
     return (message.chat.id, group or message.message_id)
+
+
+def _context(message) -> str:
+    """`chat=<id> user=<id>` для warning-ов сервиса; безопасно к частичным двойникам."""
+    chat = getattr(message, "chat", None)
+    user = getattr(message, "from_user", None)
+    return f"chat={getattr(chat, 'id', '?')} user={getattr(user, 'id', '?')}"
+
+
+def _reason(exc: Exception) -> str:
+    """Причина сбоя одной строкой: переводы строк и повторы пробелов схлопнуты."""
+    return " ".join(str(exc).split()) or type(exc).__name__
 
 
 def album_pending(
@@ -298,6 +311,7 @@ async def arm_album(message) -> None:
         album.first_pending = False
         if not album.images and album.pending == 0:
             _drop_album(key, album)
+        log.warning("Картинка не принята (%s): %s", _context(message), _reason(exc))
         await message.answer(str(exc))
         return
     album.pending -= 1
@@ -325,6 +339,7 @@ async def add_album_image(message) -> None:
     try:
         raw = await download_message_image(message)
     except images.ImageError as exc:
+        log.warning("Картинка не принята (%s): %s", _context(message), _reason(exc))
         await message.answer(str(exc))
         return
     finally:
@@ -356,9 +371,19 @@ async def compare_images(message, a: bytes, b: bytes) -> None:
             aspect=settings.cmp_aspect_pair,
         )
     except images.ImageError as exc:
+        log.warning(
+            "Не удалось собрать сравнение (%s, cmp=<не присвоен>): %s",
+            _context(message),
+            _reason(exc),
+        )
         await message.answer(str(exc))
         return
     except build.WidgetTooLarge:
+        log.warning(
+            "Виджет не уложился в лимиты (%s, cmp=<не присвоен>): "
+            "картинки слишком пёстрые для бабла",
+            _context(message),
+        )
         await message.answer(TOO_LARGE_TEXT)
         return
 
@@ -501,10 +526,18 @@ async def compare_urls(message, urls: list[str]) -> None:
                 )
             )
         except images.ImageError as exc:
+            log.warning("Ссылка не принята (%s): %s", _context(message), _reason(exc))
             await message.answer(str(exc))
             return
         except Exception as exc:  # noqa: BLE001 — сеть бывает разной, стек не нужен
-            log.info("Не удалось скачать картинку по ссылке %s: %s", url, exc)
+            # URL пришёл от пользователя: в нём может быть `startapp`-токен
+            # (`https://t.me/<bot>?startapp=<id>_<sig>`), а видимым он должен
+            # оставаться только в строке запроса мини-аппа.
+            log.info(
+                "Не удалось скачать картинку по ссылке %s: %s",
+                _one_line(redact_url(url), 2048),
+                _one_line(redact_url(str(exc)), 512),
+            )
             await message.answer("Не удалось скачать картинку по ссылке, попробуйте ещё раз.")
             return
 

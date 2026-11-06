@@ -26,3 +26,6 @@ logs/
 data/
 var/
 out/
+
+# Agent run artifacts
+.pi/

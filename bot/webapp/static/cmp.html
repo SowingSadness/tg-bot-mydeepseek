@@ -239,6 +239,13 @@ function applyTheme() {
     if (tg && tg.setHeaderColor) tg.setHeaderColor(bg);
     if (tg && tg.setBackgroundColor) tg.setBackgroundColor(bg);
   } catch (err) { /* старые клиенты не умеют — не беда */ }
+  // Смена темы (в том числе при старте) — повод перерисовать кадр: палитра
+  // изменилась, и старый кадр может не совпадать с фоном.
+  try {
+    draw();
+  } catch (err) {
+    report('error', err, 'render');
+  }
 }
 
 // ----------------------------------------------------------- экраны статуса
@@ -394,8 +401,21 @@ function load() {
     state.data = data;
     return loadComparison(data);
   }).then(function () {
-    hideScreen();
-    layout();
+    // Первый кадр — только после того, как обе картинки декодированы:
+    // workspace() меряет сцену и вызывает draw(). Если отрисовка упала,
+    // нельзя оставлять скрытый экран загрузки и пустой канвас.
+    try {
+      hideScreen();
+      workspace();
+    } catch (err) {
+      report('error', err, 'render');
+      showScreen(
+        'retry',
+        'Не удалось отрисовать',
+        'Сравнение загружено, но картинку не удалось показать. Попробуйте ещё раз.',
+        true
+      );
+    }
   }).catch(function (error) {
     var kind = error && error.kind;
     if (!kind) report('error', (error && error.message) || error, 'load');
@@ -789,7 +809,11 @@ window.addEventListener('keydown', function (event) {
 function onResize() {
   clearTimeout(resizeTimer);
   resizeTimer = setTimeout(function () {
-    workspace();
+    try {
+      workspace();
+    } catch (err) {
+      report('error', err, 'render');
+    }
   }, 80);
 }
 

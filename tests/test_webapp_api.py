@@ -16,6 +16,7 @@ import hashlib
 import hmac
 import json
 import logging
+import re
 import time
 from io import BytesIO
 from pathlib import Path
@@ -30,7 +31,7 @@ from PIL import Image, features
 from bot.compare import originals, webauth
 from bot.compare.store import ComparisonStore
 from bot.config import settings
-from bot.webapp.api import CLIENT_LOGS_KEY, build_webapp_app
+from bot.webapp.api import CLIENT_LOG_PATH, CLIENT_LOGS_KEY, build_webapp_app, log_requests
 
 BOT_TOKEN = settings.telegram_bot_token
 OWNER_ID = 7
@@ -387,28 +388,46 @@ async def test_page_served_from_static_dir(
 # ------------------------------------------------------- журнал запросов
 
 
-def webapp_lines(caplog: pytest.LogCaptureFixture, *, prefix: str = "webapp ") -> list:
-    """Записи лога с началом `prefix` — только строки middleware, без прочего шума."""
-    return [record for record in caplog.records if record.getMessage().startswith(prefix)]
+#: Строка запроса middleware: `<status> <METHOD> <url> — <N> мс[ cmp=…][ user=…]`.
+REQUEST_LINE_RE = re.compile(
+    r"^\d{3} [A-Z]+ \S+ — \d+ мс(?: cmp=\S+)?(?: user=-?\d+)?$"
+)
 
 
-async def test_request_logged_at_info_without_token(
+def webapp_lines(
+    caplog: pytest.LogCaptureFixture, *, method: str | None = None
+) -> list[logging.LogRecord]:
+    """Записи middleware — только строки запроса, без `webapp[client]`-payload."""
+    lines = [
+        record
+        for record in caplog.records
+        if REQUEST_LINE_RE.match(record.getMessage())
+    ]
+    if method is not None:
+        lines = [record for record in lines if f" {method} " in record.getMessage()]
+    return lines
+
+
+async def test_request_logged_at_info_with_visible_token(
     client: TestClient, cmp_id: str, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """Один `INFO`-рядок о запросе, с `user=`, но без `startapp`-токена."""
+    """Один `INFO`-рядок о запросе: `<status> <METHOD> <url> — <N> мс` + `user=`.
+
+    Токен `startapp` в URL виден по требованию заказчика, `init_data` — нет.
+    """
     token = webauth.sign(cmp_id)
     with caplog.at_level(logging.INFO):
         response = await client.get(f"/api/cmp/{token}", headers=auth())
     assert response.status == 200
 
-    lines = [record for record in webapp_lines(caplog) if "webapp GET" in record.getMessage()]
+    lines = webapp_lines(caplog, method="GET")
     assert len(lines) == 1
     line = lines[0].getMessage()
     assert lines[0].levelno == logging.INFO
-    assert " 200 " in line
+    assert line.startswith(f"200 GET /api/cmp/{token} — ")
     assert f"user={OWNER_ID}" in line
-    assert token not in caplog.text
     assert "init_data" not in caplog.text
+    assert BOT_TOKEN not in caplog.text
 
 
 async def test_query_init_data_value_is_redacted_in_log(
@@ -422,7 +441,12 @@ async def test_query_init_data_value_is_redacted_in_log(
         )
     assert response.status == 200
     assert init_data not in caplog.text
-    assert "init_data=<redacted>" in caplog.text
+    assert "init_data=<скрыто>" in caplog.text
+    lines = webapp_lines(caplog, method="GET")
+    assert len(lines) == 1
+    assert lines[0].getMessage().startswith("200 GET /api/cmp/")
+    assert f"user={OWNER_ID}" in lines[0].getMessage()
+    assert BOT_TOKEN not in caplog.text
 
 
 async def test_broken_token_logged_as_warning(
@@ -434,13 +458,12 @@ async def test_broken_token_logged_as_warning(
     assert response.status == 403
 
     warnings = [
-        record
-        for record in webapp_lines(caplog)
-        if record.levelno == logging.WARNING and "webapp GET" in record.getMessage()
+        record for record in webapp_lines(caplog) if record.levelno == logging.WARNING
     ]
     assert len(warnings) == 1
-    assert " 403 " in warnings[0].getMessage()
-    assert token not in caplog.text
+    line = warnings[0].getMessage()
+    assert line.startswith(f"403 GET /api/cmp/{token} — ")
+    assert "user=" not in line  # 403 не даёт проверенного пользователя
 
 
 async def test_http_exception_logged_as_single_warning(
@@ -462,7 +485,7 @@ async def test_http_exception_logged_as_single_warning(
         record for record in webapp_lines(caplog) if record.levelno == logging.WARNING
     ]
     assert len(warnings) == 1
-    assert "webapp GET /forbidden 403" in warnings[0].getMessage()
+    assert warnings[0].getMessage().startswith("403 GET /forbidden — ")
 
 
 async def test_unhandled_exception_logged_as_error(
@@ -484,7 +507,7 @@ async def test_unhandled_exception_logged_as_error(
         record for record in webapp_lines(caplog) if record.levelno == logging.ERROR
     ]
     assert len(errors) == 1
-    assert "webapp GET /boom 500" in errors[0].getMessage()
+    assert errors[0].getMessage().startswith("500 GET /boom — ")
 
 
 
@@ -497,11 +520,12 @@ async def test_healthz_logged_at_info(
 
     lines = [
         record
-        for record in webapp_lines(caplog)
-        if "webapp GET /healthz 200" in record.getMessage()
+        for record in webapp_lines(caplog, method="GET")
+        if "/healthz" in record.getMessage()
     ]
     assert len(lines) == 1
     assert lines[0].levelno == logging.INFO
+    assert lines[0].getMessage().startswith("200 GET /healthz — ")
     assert "user=" not in lines[0].getMessage()
 
 
@@ -635,7 +659,7 @@ async def test_client_log_empty_message_is_bad_request(
 async def test_client_log_rate_limited_to_30_per_minute(
     client: TestClient, cmp_id: str, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """31-е сообщение в минуту — `204`, но в лог не пишется."""
+    """31-е сообщение в минуту — `204`, но отчёт отброшен с одной `WARNING`-строкой."""
     token = webauth.sign(cmp_id)
     with caplog.at_level(logging.INFO):
         for index in range(31):
@@ -645,12 +669,111 @@ async def test_client_log_rate_limited_to_30_per_minute(
             )
             assert response.status == 204
 
-    records = [
+    payload = [
         record
         for record in caplog.records
         if "webapp[client]" in record.getMessage()
+        and "отброшен" not in record.getMessage()
     ]
-    assert len(records) == 30
+    assert len(payload) == 30
+
+    dropped = [
+        record
+        for record in caplog.records
+        if "webapp[client]" in record.getMessage()
+        and "отброшен" in record.getMessage()
+    ]
+    assert len(dropped) == 1
+    assert dropped[0].levelno == logging.WARNING
+    line = dropped[0].getMessage()
+    assert f"cmp={cmp_id}" in line
+    assert "лимит 30" in line
+    assert "where=load" in line
+    # Тело отброшенного отчёта в лог не попадает.
+    assert "boom 30" not in caplog.text
+
+
+async def test_client_log_request_line_is_error(
+    client: TestClient, cmp_id: str, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Строка запроса `POST /api/cmp/log` — `ERROR` даже при `204`, с `cmp=`."""
+    token = webauth.sign(cmp_id)
+    with caplog.at_level(logging.INFO):
+        response = await client.post(
+            "/api/cmp/log",
+            json={"token": token, "message": "boom", "where": "render"},
+        )
+    assert response.status == 204
+
+    lines = webapp_lines(caplog, method="POST")
+    assert len(lines) == 1
+    line = lines[0].getMessage()
+    assert lines[0].levelno == logging.ERROR  # не INFO, хотя статус 204
+    assert line.startswith("204 POST /api/cmp/log — ")
+    assert f"cmp={cmp_id}" in line
+    assert "init_data" not in caplog.text
+    assert token not in caplog.text
+    assert BOT_TOKEN not in caplog.text
+
+    payload = [
+        record for record in caplog.records if "webapp[client]" in record.getMessage()
+    ]
+    assert len(payload) == 1
+    assert payload[0].levelno == logging.ERROR
+    assert "where=render" in payload[0].getMessage()
+
+
+class _FakeRequest(dict):
+    """Двойник `web.Request` для прямого вызова middleware (умеет `request["key"]`)."""
+
+    method = "POST"
+    path = CLIENT_LOG_PATH
+    path_qs = CLIENT_LOG_PATH
+
+
+async def test_client_log_line_carries_cmp_and_user(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Middleware дописывает `cmp=`/`user=`, когда контекст запроса их знает."""
+    request = _FakeRequest()
+    request["webapp_cmp_id"] = 337326
+    request["webapp_user_id"] = 128640797
+
+    async def handler(_request: web.Request) -> web.Response:
+        return web.Response(status=204)
+
+    with caplog.at_level(logging.INFO):
+        response = await log_requests(request, handler)
+    assert response.status == 204
+
+    lines = webapp_lines(caplog, method="POST")
+    assert len(lines) == 1
+    assert lines[0].levelno == logging.ERROR
+    assert lines[0].getMessage().startswith("204 POST /api/cmp/log — ")
+    assert lines[0].getMessage().endswith(" cmp=337326 user=128640797")
+
+
+async def test_exactly_one_request_line_per_request(
+    client: TestClient, cmp_id: str, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Одна строка на запрос: `GET` — `INFO`, отчёт клиента — `ERROR`."""
+    token = webauth.sign(cmp_id)
+    with caplog.at_level(logging.INFO):
+        assert (await client.get("/healthz")).status == 200
+        assert (await client.get(f"/api/cmp/{token}", headers=auth())).status == 200
+        assert (
+            await client.post(
+                "/api/cmp/log", json={"token": token, "message": "boom"}
+            )
+        ).status == 204
+
+    lines = webapp_lines(caplog)
+    assert len(lines) == 3
+    assert [record.levelno for record in lines] == [
+        logging.INFO,
+        logging.INFO,
+        logging.ERROR,
+    ]
 
 
 async def test_client_log_prunes_dead_keys_after_window(
