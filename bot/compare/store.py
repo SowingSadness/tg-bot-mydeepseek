@@ -12,11 +12,14 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import secrets
 import sqlite3
 import time
 from dataclasses import dataclass
 from pathlib import Path
+
+log = logging.getLogger(__name__)
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS comparisons (
@@ -174,26 +177,49 @@ class ComparisonStore:
             params.append(owner_id)
         return conn.execute(sql, params).fetchone()
 
-    def _purge(self, ttl_seconds: float, max_entries: int, now: float) -> int:
-        """Удаляет устаревшее и лишнее одной транзакцией (один поток)."""
+    def _purge(self, ttl_seconds: float, max_entries: int, now: float) -> list[str]:
+        """Удаляет устаревшее и лишнее одной транзакцией (один поток).
+
+        Возвращает номера удалённых записей: по ним вызывающий чистит файлы
+        оригиналов мини-аппа (в БД о них ничего нет).
+        """
         conn = self._connection()
+        cutoff = now - ttl_seconds
+        limit = max(0, int(max_entries))
         try:
-            expired = conn.execute(
-                "DELETE FROM comparisons WHERE created_at < ?",
-                (now - ttl_seconds,),
-            ).rowcount
-            extra = conn.execute(
-                "DELETE FROM comparisons WHERE id IN ("
-                "  SELECT id FROM comparisons"
-                "  ORDER BY created_at DESC, rowid DESC LIMIT -1 OFFSET ?"
-                ")",
-                (max(0, int(max_entries)),),
-            ).rowcount
+            expired = [
+                str(row[0])
+                for row in conn.execute(
+                    "SELECT id FROM comparisons WHERE created_at < ?",
+                    (cutoff,),
+                )
+            ]
+            if expired:
+                conn.execute(
+                    "DELETE FROM comparisons WHERE created_at < ?",
+                    (cutoff,),
+                )
+            extra = [
+                str(row[0])
+                for row in conn.execute(
+                    "SELECT id FROM comparisons"
+                    " ORDER BY created_at DESC, rowid DESC LIMIT -1 OFFSET ?",
+                    (limit,),
+                )
+            ]
+            if extra:
+                conn.execute(
+                    "DELETE FROM comparisons WHERE id IN ("
+                    "  SELECT id FROM comparisons"
+                    "  ORDER BY created_at DESC, rowid DESC LIMIT -1 OFFSET ?"
+                    ")",
+                    (limit,),
+                )
             conn.commit()
         except BaseException:
             conn.rollback()
             raise
-        return int(expired) + int(extra)
+        return expired + extra
 
     def _count(self) -> int:
         row = self._connection().execute("SELECT COUNT(*) FROM comparisons").fetchone()
@@ -300,16 +326,35 @@ class ComparisonStore:
         async with self._lock:
             await asyncio.to_thread(self._set_preview_file_id, str(cmp_id), str(file_id))
 
-    async def purge(self, *, ttl_seconds: float, max_entries: int) -> int:
+    async def purge(
+        self,
+        *,
+        ttl_seconds: float,
+        max_entries: int,
+        on_removed=None,
+    ) -> int:
         """Удаляет записи старше TTL и лишние сверх `max_entries`.
 
-        Оставляет самые свежие по `created_at`. Возвращает число удалённых записей.
+        Оставляет самые свежие по `created_at`. `on_removed(cmp_id)` — синхронный
+        колбэк для каждой удалённой записи (им чистятся файлы оригиналов): он
+        вызывается **после** коммита и вне блокировки, поэтому может ходить в
+        файловую систему. Исключение колбэка — warning, purge продолжается.
+        Возвращает число удалённых записей.
         """
         now = time.time()
         async with self._lock:
-            return await asyncio.to_thread(
+            removed = await asyncio.to_thread(
                 self._purge, float(ttl_seconds), int(max_entries), now
             )
+
+        for cmp_id in removed:
+            if on_removed is None:
+                continue
+            try:
+                on_removed(cmp_id)
+            except Exception as exc:  # noqa: BLE001 — уборка файлов не должна ломать purge
+                log.warning("Не удалось очистить файлы сравнения #%s: %s", cmp_id, exc)
+        return len(removed)
 
     async def count(self) -> int:
         """Сколько сравнений сейчас в кеше."""

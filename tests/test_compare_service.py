@@ -171,7 +171,6 @@ class FakeStore:
 
 class FakeAPI:
     """Bot API-двойник: пишет отправки в общий список, умеет падать."""
-
     def __init__(self, calls: list, error: WidgetAPIError | None = None) -> None:
         self.calls = calls
         self.error = error
@@ -192,6 +191,29 @@ class FakeAPI:
         return {"message_id": 1}
 
 
+class FakeOriginals:
+    """Двойник `originals.save`: пишет вызов в общий список и умеет «падать»."""
+
+    def __init__(self, calls: list) -> None:
+        self.calls = calls
+        self.error: Exception | None = None
+
+    def save(
+        self,
+        cache_dir,
+        cmp_id: str,
+        img_a,
+        img_b,
+        *,
+        width: int = 1600,
+        aspect: str = "3:2",
+    ) -> dict[str, str]:
+        self.calls.append(("originals.save", cache_dir, cmp_id, width, aspect))
+        if self.error is not None:
+            raise self.error
+        return {}
+
+
 def _drop_albums() -> None:
     """Снимает буферы, дебаунс-задачи и закрытые ключи между тестами."""
     for album in list(service._albums.values()):
@@ -210,16 +232,24 @@ async def settle() -> None:
 
 @pytest.fixture
 def env(monkeypatch):
-    """Свежие фейки кеша/API, короткий дебаунс и пустой буфер на каждый тест."""
+    """Свежие фейки кеша/API, короткий дебаунс и пустой буфер на каждый тест.
+
+    `originals.save` тоже подменён: настоящий кодирует AVIF в диск, а /cmp-тестам
+    нужен только сам факт вызова и его аргументы.
+    """
     calls: list = []
     store = FakeStore(calls)
     fake_api = FakeAPI(calls)
+    fake_originals = FakeOriginals(calls)
     service.configure_store(store)
     api_module.configure(fake_api)
+    monkeypatch.setattr(service.originals, "save", fake_originals.save)
     monkeypatch.setattr(service, "_album_wait", lambda: 0.01)
     _drop_albums()
 
-    yield SimpleNamespace(calls=calls, store=store, api=fake_api)
+    yield SimpleNamespace(
+        calls=calls, store=store, api=fake_api, originals=fake_originals
+    )
 
     _drop_albums()
     service.configure_store(None)
@@ -594,6 +624,9 @@ async def test_caption_contains_id_and_save_goes_before_send(env):
 
     widgets = _widgets(env.calls)
     assert len(widgets) == 1
+    # Подпись — две строки: заголовок и `@бот #номер` отдельной строкой.
+    assert widgets[0][3] == "Номер сравнения:\n@test_bot #482913"
+    assert "\n@test_bot" in widgets[0][3]
     assert f"#{CMP_ID}" in widgets[0][3]
     assert widgets[0][1] == CHAT_ID
     assert widgets[0][4] == 0 and widgets[0][5] == 0
@@ -603,7 +636,46 @@ async def test_caption_contains_id_and_save_goes_before_send(env):
     names = _names(env.calls)
     assert names.index("store.save") < names.index("api.send_widget")
     assert _saves(env.calls)[0][2]["aspect"] == "3:2"
-    assert any(f"#{CMP_ID}" in answer for answer in message.answers)
+    # Подсказка после успеха — тоже две строки, `@бот #номер` с новой строки.
+    assert message.answers == ["Номер сравнения: #482913\n@test_bot #482913"]
+    assert "\n@test_bot" in message.answers[0]
+
+
+async def test_originals_are_saved_after_store_and_before_send(env):
+    """Оригиналы для мини-аппа сохраняются после записи в кеш и до отправки виджета."""
+    message = FakeMessage(env.calls)
+    await service.compare_images(message, PNG_A, PNG_B)
+
+    saves = _by_name(env.calls, "originals.save")
+    assert len(saves) == 1
+    _, cache_dir, cmp_id, width, aspect = saves[0]
+    assert cache_dir == settings.cmp_cache_dir
+    assert cmp_id == CMP_ID
+    # `CMP_ORIGINALS_WIDTH` появится в конфиге на шаге 7 — пока дефолт 1600.
+    assert width == 1600
+    assert aspect == "3:2"
+
+    names = _names(env.calls)
+    assert (
+        names.index("store.save")
+        < names.index("originals.save")
+        < names.index("api.send_widget")
+    )
+
+
+async def test_originals_failure_warns_and_keeps_widget_hint_and_preview(env, caplog):
+    """Сбой сохранения оригиналов: warning, но виджет, подсказка и превью на месте."""
+    env.originals.error = RuntimeError("disk full")
+    message = FakeMessage(env.calls)
+
+    with caplog.at_level(logging.WARNING, logger=service.log.name):
+        await service.compare_images(message, PNG_A, PNG_B)
+
+    assert "оригинал" in caplog.text and "disk full" in caplog.text
+    assert len(_widgets(env.calls)) == 1
+    assert message.answers == ["Номер сравнения: #482913\n@test_bot #482913"]
+    assert len(_by_name(env.calls, "bot.send_photo")) == 1
+    assert _by_name(env.calls, "store.set_preview_file_id")
 
 
 async def test_widget_api_error_falls_back_to_album_and_reports_id(env):

@@ -9,6 +9,14 @@ services:
     volumes:
       # Кеш сравнений /cmp: номера живут между перезапусками и пересборками образа.
       - cmp-cache:/app/var/cmp
+    ports:
+      # Мини-апп /app/cmp. Снаружи — только loopback: TLS и домен даёт
+      # nginx/Caddy (proxy_pass http://127.0.0.1:8081).
+      - "127.0.0.1:8081:8081"
+    environment:
+      # В контейнере слушаем все интерфейсы, наружу порт публикуется только на loopback.
+      CMP_WEBAPP_HOST: 0.0.0.0
+      CMP_WEBAPP_PORT: "8081"
     logging:
       driver: json-file
       options:

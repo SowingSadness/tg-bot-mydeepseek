@@ -31,7 +31,7 @@ from aiogram.types import BufferedInputFile, InputMediaDocument
 from .. import respond
 from ..config import settings
 from . import api as api_module
-from . import build, images, preview
+from . import build, images, originals, preview
 from .store import ComparisonStore
 
 log = logging.getLogger(__name__)
@@ -104,6 +104,16 @@ def _preview_width() -> int:
     except (TypeError, ValueError):
         return 2560
     return width if width >= 2 else 2560
+
+
+def _originals_width() -> int:
+    """Ширина оригиналов для мини-аппа: `CMP_ORIGINALS_WIDTH`, по умолчанию 1600."""
+    default = originals.DEFAULT_WIDTH
+    try:
+        width = int(getattr(settings, "cmp_originals_width", default))
+    except (TypeError, ValueError):
+        return default
+    return width if width >= 1 else default
 
 
 def _album_key(message) -> AlbumKey:
@@ -364,7 +374,24 @@ async def compare_images(message, a: bytes, b: bytes) -> None:
         zlib_bytes=built.zlib_bytes,
         aspect=built.aspect,
     )
-    caption = settings.cmp_caption.format(id=cmp_id, a=labels[0], b=labels[1])
+    # Оригиналы для мини-аппа: WebP + AVIF в полном разрешении. Украшение и
+    # тяжёлое кодирование (to_thread), поэтому любой сбой — только warning.
+    try:
+        await asyncio.to_thread(
+            originals.save,
+            settings.cmp_cache_dir,
+            cmp_id,
+            img_a,
+            img_b,
+            width=_originals_width(),
+            aspect=built.aspect,
+        )
+    except Exception as exc:  # noqa: BLE001 — оригиналы не должны ломать /cmp
+        log.warning("Не удалось сохранить оригиналы сравнения #%s: %s", cmp_id, exc)
+
+    caption = settings.cmp_caption.format(
+        id=cmp_id, a=labels[0], b=labels[1], bot=settings.bot_username
+    )
     html = build.render_cached(
         image_a=built.image_a,
         image_b=built.image_b,
@@ -390,7 +417,7 @@ async def compare_images(message, a: bytes, b: bytes) -> None:
     else:
         if settings.cmp_show_hint:
             await message.answer(
-                f"Номер сравнения: #{cmp_id}. В любом чате: @{settings.bot_username} #{cmp_id}"
+                f"Номер сравнения: #{cmp_id}\n@{settings.bot_username} #{cmp_id}"
             )
 
     # Превью — украшение inline-выдачи: его сбой не должен съедать номер и бабл.

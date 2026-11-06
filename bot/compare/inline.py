@@ -20,15 +20,12 @@ Inline-режим обязан ответить примерно за 10 сек�
 
 from __future__ import annotations
 
-import base64
-import hashlib
-import hmac
 import logging
 import re
 
 from ..config import settings
 from . import api as api_module
-from . import build, service
+from . import build, service, webauth
 from .store import Cached
 
 log = logging.getLogger(__name__)
@@ -42,28 +39,14 @@ HINT_RE = re.compile(r"^#\d{0,8}$")
 MISSING_DESCRIPTION = "Номер не найден или истёк. Сделайте сравнение в личке с ботом."
 
 
-#: Сколько символов подписи оставляем в ``startapp`` (base64url, без ``=``).
-_START_SIG_LEN = 20
-
-
 def _start_token(cmp_id: str) -> str:
     """Подпись для ``startapp``: ``<id>_<20 симв. base64url>`` (≤ 64 символов).
 
-    Разделитель — ``_``, а не ``.``: Telegram документирует ``startapp``
-    как base64url (``A-Za-z0-9_-``), точка вне алфавита. Стабильна для
-    одного и того же номера (HMAC от токена бота и номера), поэтому
-    Telegram кеширует мини-апп, а подделать чужой номер нельзя.
+    Тонкая обёртка над `webauth.sign`: тот же HMAC-SHA256 от токена бота и
+    номера, поэтому уже отправленные в чат кнопки продолжают работать, а
+    формула подписи живёт в одном месте с проверкой мини-аппа.
     """
-    sig = (
-        base64.urlsafe_b64encode(
-            hmac.new(
-                settings.telegram_bot_token.encode(), cmp_id.encode(), hashlib.sha256
-            ).digest()
-        )
-        .decode()
-        .rstrip("=")
-    )[:_START_SIG_LEN]
-    return f"{cmp_id}_{sig}"
+    return webauth.sign(cmp_id)
 
 
 def _photo_result(cached: Cached) -> dict:

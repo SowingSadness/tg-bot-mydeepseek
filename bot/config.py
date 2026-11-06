@@ -72,7 +72,8 @@ class Settings(BaseSettings):
     cmp_show_hint: bool = True
     cmp_allow_private_hosts: bool = False
     cmp_labels: str = "До|После"
-    cmp_caption: str = "Сравнение #{id} · {a} / {b}"
+    # Подпись под баблом. Доступны {id}, {a}, {b}, {bot}; многострочность — через `\n`.
+    cmp_caption: str = "Номер сравнения:\n@{bot} #{id}"
     cmp_title: str = "Сравнение"
     cmp_hint: str = "Проведите ↔"
     # Short name мини-аппа из BotFather для кнопки «Открыть сравнение».
@@ -84,6 +85,19 @@ class Settings(BaseSettings):
     # Бета Bot API отклоняет widget в inline (INPUT_MEDIA_WIDGET_NOT_ALLOWED),
     # поэтому по умолчанию false: остаются фото-превью, кнопка и текстовый результат.
     cmp_inline_widget: bool = False
+
+    # Мини-апп сравнения (/app/cmp): отдельный aiohttp-сервер в процессе бота.
+    # 0 = сервер не поднимается (поведение как раньше). TLS — снаружи (nginx/Caddy).
+    cmp_webapp_port: int = 0
+    # Интерфейс, на котором слушает сервер мини-аппа (в Docker — 0.0.0.0).
+    cmp_webapp_host: str = "127.0.0.1"
+    # Публичный адрес страницы мини-аппа для логов/документации,
+    # например https://example.com/app/cmp. Пусто = не печатать.
+    cmp_webapp_public_url: str = ""
+    # Ширина оригиналов для мини-аппа (WebP всегда, AVIF — если умеет Pillow).
+    cmp_originals_width: int = 1600
+    # Сколько секунд живёт initData мини-аппа (по умолчанию сутки).
+    cmp_webapp_auth_ttl: int = 86400
 
     @field_validator("cmp_labels")
     @classmethod

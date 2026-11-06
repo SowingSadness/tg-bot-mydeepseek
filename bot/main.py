@@ -5,12 +5,15 @@ from __future__ import annotations
 import asyncio
 import logging
 from contextlib import suppress
+from pathlib import Path
 
+from aiohttp import web
 from aiogram import Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
 from aiogram.types import BotCommand
 
 from .compare import api as compare_api
+from .compare import originals
 from .compare import service as compare_service
 from .compare.api import WidgetAPI
 from .compare.store import ComparisonStore
@@ -19,11 +22,15 @@ from .deepseek import deepseek
 from .handlers import compare, group, inline, private
 from .logging_setup import describe_update, setup_logging
 from .respond import close_file_session
+from .webapp.api import build_webapp_app
 
 log = logging.getLogger(__name__)
 
 #: Как часто фоновая задача чистит кеш сравнений по TTL и по числу записей.
 COMPARE_PURGE_INTERVAL = 6 * 3600
+
+#: Статика мини-аппа лежит в пакете (`COPY bot ./bot` в Dockerfile её захватывает).
+WEBAPP_STATIC_DIR = Path(__file__).resolve().parent / "webapp" / "static"
 
 
 async def _warmup() -> None:
@@ -103,6 +110,7 @@ async def setup_compare() -> None:
     removed = await store.purge(
         ttl_seconds=settings.cmp_cache_ttl_days * 86_400,
         max_entries=settings.cmp_cache_max_entries,
+        on_removed=_remove_originals,
     )
     log.info(
         "Кеш сравнений: %s (удалено %d, осталось %d)",
@@ -110,6 +118,60 @@ async def setup_compare() -> None:
         removed,
         await store.count(),
     )
+
+
+def _remove_originals(cmp_id: str) -> None:
+    """Колбэк `store.purge`: удаляет файлы оригиналов вместе с записью кеша."""
+    originals.remove(settings.cmp_cache_dir, cmp_id)
+
+
+async def setup_webapp() -> web.AppRunner | None:
+    """Поднимает HTTP-сервер мини-аппа, если задан `CMP_WEBAPP_PORT` (> 0).
+
+    При `CMP_WEBAPP_PORT=0` (по умолчанию) возвращает `None`: бот работает
+    как раньше, без лишнего сокета. Сервер слушает `CMP_WEBAPP_HOST` (по
+    умолчанию loopback), TLS терминирует nginx/Caddy снаружи.
+    """
+    try:
+        port = int(settings.cmp_webapp_port)
+    except (TypeError, ValueError):
+        port = 0
+    if port <= 0:
+        log.debug("Мини-апп выключен: CMP_WEBAPP_PORT=%s", settings.cmp_webapp_port)
+        return None
+
+    store = compare_service.get_store()
+    host = settings.cmp_webapp_host
+    app = build_webapp_app(
+        store=store,
+        cache_dir=settings.cmp_cache_dir,
+        bot_token=settings.telegram_bot_token,
+        labels=settings.cmp_labels_pair,
+        share_by_id=settings.cmp_share_by_id,
+        static_dir=WEBAPP_STATIC_DIR,
+    )
+    # access_log=None: в URL мини-аппа лежит `startapp`-токен, его нельзя писать в лог.
+    runner = web.AppRunner(app, access_log=None)
+    await runner.setup()
+    try:
+        site = web.TCPSite(runner, host, port)
+        await site.start()
+    except Exception:
+        await runner.cleanup()
+        raise
+
+    log.info("Мини-апп: http://%s:%d/app/cmp", host, port)
+    if settings.cmp_webapp_public_url:
+        log.info("Мини-апп снаружи: %s", settings.cmp_webapp_public_url)
+    return runner
+
+
+async def teardown_webapp(runner: web.AppRunner | None) -> None:
+    """Гасит HTTP-сервер мини-аппа; безопасно для `None` и повторного вызова."""
+    if runner is None:
+        return
+    with suppress(Exception):  # noqa: BLE001 — на остановке важнее дойти до конца
+        await runner.cleanup()
 
 
 async def _purge_loop(interval: float = COMPARE_PURGE_INTERVAL) -> None:
@@ -125,6 +187,7 @@ async def _purge_loop(interval: float = COMPARE_PURGE_INTERVAL) -> None:
             removed = await store.purge(
                 ttl_seconds=settings.cmp_cache_ttl_days * 86_400,
                 max_entries=settings.cmp_cache_max_entries,
+                on_removed=_remove_originals,
             )
         except Exception:  # noqa: BLE001 — фоновая задача не должна падать навсегда
             log.exception("Не удалось почистить кеш сравнений")
@@ -165,11 +228,13 @@ async def main() -> None:
     )
     dispatcher = build_dispatcher()
     background: list[asyncio.Task] = []
+    webapp_runner: web.AppRunner | None = None
 
     # `finally` с `setup_compare`: кеш и HTTP-сессия закрываются, даже если
     # `get_me()` или `start_polling` упали на сети.
     try:
         await setup_compare()
+        webapp_runner = await setup_webapp()
 
         await _set_commands(bot)
         await bot.delete_webhook(drop_pending_updates=True)
@@ -200,6 +265,8 @@ async def main() -> None:
         for task in background:
             with suppress(asyncio.CancelledError):
                 await task
+        # Сначала гасим мини-апп (он читает кеш), потом закрываем кеш и API.
+        await teardown_webapp(webapp_runner)
         await teardown_compare()
         with suppress(Exception):  # noqa: BLE001 — сессия файлов может быть не создана
             await close_file_session()

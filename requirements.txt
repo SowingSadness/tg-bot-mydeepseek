@@ -1,4 +1,8 @@
 aiogram>=3.13,<4
+# aiohttp используется напрямую (не только транзитивно через aiogram):
+# мини-апп сравнения (`bot/webapp/api.py`) и скачивание файлов Bot API
+# (`bot/respond.py`), поэтому версия закреплена явно.
+aiohttp>=3.9,<4
 openai>=1.40,<2
 pydantic-settings>=2.4,<3
 Pillow>=12,<14

@@ -1,0 +1,779 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="color-scheme" content="dark light">
+<meta name="robots" content="noindex">
+<title>Сравнение</title>
+<style>
+:root{
+  --bg:#17212b;
+  --text:#f5f5f5;
+  --hint:#8b9aa8;
+  --button:#2ea6ff;
+  --button-text:#ffffff;
+  --chip:rgba(0,0,0,.62);
+}
+*{box-sizing:border-box}
+html,body{margin:0;height:100%;background:var(--bg);color:var(--text)}
+body{
+  font:14px/1.4 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"Helvetica Neue",Arial,sans-serif;
+  overflow:hidden;
+  overscroll-behavior:none;
+  -webkit-text-size-adjust:100%;
+  -webkit-tap-highlight-color:transparent;
+}
+#app{
+  display:flex;
+  flex-direction:column;
+  height:100%;
+  height:100dvh;
+  padding:env(safe-area-inset-top) env(safe-area-inset-right) env(safe-area-inset-bottom) env(safe-area-inset-left);
+}
+#bar{display:flex;align-items:center;gap:8px;flex:0 0 auto;min-height:44px;padding:8px 12px}
+#title{flex:1 1 auto;min-width:0;font-weight:600;font-size:15px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+button{
+  font:inherit;
+  color:var(--button-text);
+  background:var(--button);
+  border:0;
+  border-radius:9px;
+  padding:8px 14px;
+  cursor:pointer;
+  touch-action:manipulation;
+}
+button:focus-visible{outline:2px solid var(--text);outline-offset:2px}
+#reset{flex:0 0 auto;padding:8px 10px;font-weight:600;color:var(--button);background:transparent}
+#stage{flex:1 1 auto;min-height:0;display:flex;align-items:center;justify-content:center;padding:0 8px 8px}
+#frame{position:relative;display:none;line-height:0;background:#000;border-radius:10px;overflow:hidden;box-shadow:0 2px 14px rgba(0,0,0,.4)}
+#canvas{display:block;touch-action:none;user-select:none;-webkit-user-select:none;cursor:ew-resize}
+.chip{
+  position:absolute;
+  top:8px;
+  padding:3px 8px;
+  border-radius:7px;
+  background:var(--chip);
+  color:#fff;
+  font-weight:600;
+  font-size:12px;
+  line-height:1.4;
+  letter-spacing:.2px;
+  pointer-events:none;
+}
+#chipA{left:8px}
+#chipB{right:8px}
+#screen{
+  position:fixed;
+  inset:0;
+  z-index:5;
+  display:flex;
+  flex-direction:column;
+  align-items:center;
+  justify-content:center;
+  gap:14px;
+  padding:28px;
+  text-align:center;
+  background:var(--bg);
+}
+#screen[hidden]{display:none}
+#screen h1{margin:0;max-width:22em;font-size:17px;font-weight:600;line-height:1.35}
+#screen p{margin:0;max-width:24em;color:var(--hint)}
+#screen button{display:none}
+#screen.retry button{display:inline-block}
+#spinner{
+  display:none;
+  width:30px;
+  height:30px;
+  border:3px solid var(--hint);
+  border-top-color:transparent;
+  border-radius:50%;
+  animation:spin 1s linear infinite;
+}
+#screen.loading #spinner{display:block}
+@keyframes spin{to{transform:rotate(360deg)}}
+@media (prefers-reduced-motion:reduce){
+  #spinner{animation-duration:3s}
+}
+</style>
+</head>
+<body>
+<div id="app" aria-busy="true">
+  <header id="bar">
+    <div id="title">Сравнение</div>
+    <button id="reset" type="button" title="Вернуть масштаб по умолчанию">Сброс</button>
+  </header>
+  <main id="stage">
+    <div id="frame">
+      <canvas id="canvas" role="img" aria-label="Сравнение: слева «До», справа «После»"></canvas>
+      <span class="chip" id="chipA">До</span>
+      <span class="chip" id="chipB">После</span>
+    </div>
+  </main>
+  <div id="screen" class="loading" role="status" aria-live="polite">
+    <div id="spinner"></div>
+    <h1 id="screen-title">Загружаем сравнение…</h1>
+    <p id="screen-text">Это займёт пару секунд.</p>
+    <button id="retry" type="button">Повторить</button>
+  </div>
+</div>
+<script src="https://telegram.org/js/telegram-web-app.js"></script>
+<script>
+(function () {
+'use strict';
+
+// Единственный внешний ресурс — официальный telegram-web-app.js: без него нет
+// ни initData, ни темы, ни кнопки «назад». Всё остальное (стили и код) инлайн.
+
+var tg = (window.Telegram && window.Telegram.WebApp) || null;
+
+var app = document.getElementById('app');
+var canvas = document.getElementById('canvas');
+var frame = document.getElementById('frame');
+var stage = document.getElementById('stage');
+var screenEl = document.getElementById('screen');
+var screenTitle = document.getElementById('screen-title');
+var screenText = document.getElementById('screen-text');
+var retryEl = document.getElementById('retry');
+var resetEl = document.getElementById('reset');
+var chipA = document.getElementById('chipA');
+var chipB = document.getElementById('chipB');
+var titleEl = document.getElementById('title');
+var ctx = canvas.getContext('2d');
+
+var ZOOM_MIN = 1;
+var ZOOM_MAX = 6;
+//: Полуширина «зоны ручки» в CSS-пикселях: рядом с разделителем тянем шторку.
+var DIVIDER_BAND = 24;
+//: Смещение меньше этого (в пикселях канваса) считается тапом, а не драгом.
+var TAP_SLOP = 8;
+//: Двойной тап — не дольше этого интервала.
+var DOUBLE_TAP_MS = 320;
+
+var state = {
+  data: null,
+  imgA: null,
+  imgB: null,
+  p: 0.5,          // положение шторки, 0..1 от ширины канваса
+  zoom: 1,
+  panX: 0,
+  panY: 0,
+  dpr: 1,
+  cw: 0,           // ширина канваса в пикселях устройства
+  ch: 0,
+  base: 1,         // масштаб cover-подгонки картинки под канвас
+  iw: 0,           // натуральная ширина картинки
+  ih: 0,
+  pointers: new Map(),
+  mode: null,      // 'split' | 'pan' | 'pinch'
+  drag: null,
+  pinch: null
+};
+var lastTapAt = 0;
+var resizeTimer = 0;
+
+function clamp(value, low, high) {
+  return value < low ? low : (value > high ? high : value);
+}
+
+function themeParam(name, fallback) {
+  try {
+    var value = tg && tg.themeParams && tg.themeParams[name];
+    return value || fallback;
+  } catch (err) {
+    return fallback;
+  }
+}
+
+// --------------------------------------------------------------------- тема
+
+function applyTheme() {
+  var bg = themeParam('bg_color', '#17212b');
+  var text = themeParam('text_color', '#f5f5f5');
+  var hint = themeParam('hint_color', '#8b9aa8');
+  var button = themeParam('button_color', '#2ea6ff');
+  var buttonText = themeParam('button_text_color', '#ffffff');
+  var style = document.documentElement.style;
+  style.setProperty('--bg', bg);
+  style.setProperty('--text', text);
+  style.setProperty('--hint', hint);
+  style.setProperty('--button', button);
+  style.setProperty('--button-text', buttonText);
+  try {
+    if (tg && tg.setHeaderColor) tg.setHeaderColor(bg);
+    if (tg && tg.setBackgroundColor) tg.setBackgroundColor(bg);
+  } catch (err) { /* старые клиенты не умеют — не беда */ }
+}
+
+// ----------------------------------------------------------- экраны статуса
+
+function showScreen(kind, title, text, canRetry) {
+  screenEl.hidden = false;
+  screenEl.className = kind || '';
+  screenTitle.textContent = title;
+  screenText.textContent = text || '';
+  retryEl.style.display = canRetry ? 'inline-block' : 'none';
+  frame.style.display = 'none';
+  app.setAttribute('aria-busy', kind === 'loading' ? 'true' : 'false');
+}
+
+function hideScreen() {
+  screenEl.hidden = true;
+  app.setAttribute('aria-busy', 'false');
+  frame.style.display = 'block';
+}
+
+// ------------------------------------------------------------ токен и данные
+
+// Для локальной отладки без Telegram — ?t=<token> в адресе страницы.
+function startToken() {
+  try {
+    var param = tg && tg.initDataUnsafe && tg.initDataUnsafe.start_param;
+    if (param) return String(param).trim();
+  } catch (err) { /* нет Telegram — пробуем query */ }
+  try {
+    var query = new URLSearchParams(window.location.search);
+    return (query.get('t') || '').trim();
+  } catch (err) {
+    return '';
+  }
+}
+
+function telegramInitData() {
+  try {
+    return (tg && tg.initData) || '';
+  } catch (err) {
+    return '';
+  }
+}
+
+function imageUrl(side) {
+  var images = (state.data && state.data.images) || {};
+  return images[side] || '';
+}
+
+function loadImage(url) {
+  return new Promise(function (resolve, reject) {
+    if (!url) {
+      reject(new Error('Нет адреса картинки'));
+      return;
+    }
+    var img = new Image();
+    img.decoding = 'async';
+    img.onload = function () { resolve(img); };
+    img.onerror = function () {
+      var err = new Error('Не удалось загрузить картинку');
+      err.kind = 'image';
+      reject(err);
+    };
+    img.src = url;
+  });
+}
+
+function loadComparison(data) {
+  return Promise.all([loadImage(imageUrl('a')), loadImage(imageUrl('b'))])
+    .then(function (images) {
+      state.imgA = images[0];
+      state.imgB = images[1];
+      state.p = 0.5;
+      state.zoom = 1;
+      state.panX = 0;
+      state.panY = 0;
+      var labels = data.labels || [];
+      var labelA = labels[0] || 'До';
+      var labelB = labels[1] || 'После';
+      chipA.textContent = labelA;
+      chipB.textContent = labelB;
+      canvas.setAttribute('aria-label', 'Сравнение: слева «' + labelA + '», справа «' + labelB + '»');
+      var title = data.id ? ('Сравнение #' + data.id) : (labelA + ' / ' + labelB);
+      titleEl.textContent = title;
+      document.title = title;
+    });
+}
+
+function retryableError(status) {
+  var err = new Error(
+    status === 401
+      ? 'Не удалось подтвердить, что сравнение открыто из Telegram. Откройте его кнопкой «Открыть сравнение» в чате.'
+      : (status === 403 || status === 404)
+        ? 'Ссылка устарела или сравнение удалено из кеша. Сделайте сравнение заново.'
+        : 'Сервер не смог отдать сравнение (код ' + status + '). Попробуйте ещё раз.'
+  );
+  err.kind = (status === 401 || status === 403 || status === 404) ? 'stale' : 'server';
+  err.status = status;
+  return err;
+}
+
+function load() {
+  state.data = null;
+  state.imgA = null;
+  state.imgB = null;
+  state.zoom = 1;
+  state.panX = 0;
+  state.panY = 0;
+  state.p = 0.5;
+
+  var token = startToken();
+  if (!token) {
+    showScreen(
+      '',
+      'Откройте сравнение из чата',
+      'Нажмите кнопку «Открыть сравнение» под результатом сравнения — страница откроется с нужным номером.',
+      false
+    );
+    return;
+  }
+
+  showScreen('loading', 'Загружаем сравнение…', 'Это займёт пару секунд.', false);
+
+  var headers = {};
+  var initData = telegramInitData();
+  if (initData) headers.Authorization = 'tma ' + initData;
+
+  fetch('/api/cmp/' + encodeURIComponent(token), {
+    method: 'GET',
+    headers: headers,
+    credentials: 'omit',
+    cache: 'no-store'
+  }).then(function (response) {
+    if (!response.ok) throw retryableError(response.status);
+    return response.json().catch(function () {
+      var err = new Error('Сервер вернул некорректный ответ. Попробуйте ещё раз.');
+      err.kind = 'server';
+      throw err;
+    });
+  }).then(function (data) {
+    if (!data || !data.images || !data.images.a || !data.images.b) {
+      var err = new Error('Сервер вернул неполные данные сравнения. Попробуйте ещё раз.');
+      err.kind = 'server';
+      throw err;
+    }
+    state.data = data;
+    return loadComparison(data);
+  }).then(function () {
+    hideScreen();
+    layout();
+  }).catch(function (error) {
+    var kind = error && error.kind;
+    if (kind === 'image') {
+      showScreen('retry', 'Картинки не загрузились', 'Проверьте связь и попробуйте ещё раз.', true);
+    } else if (kind === 'stale') {
+      showScreen('', 'Ссылка недействительна', error.message, false);
+    } else if (kind === 'server') {
+      showScreen('retry', 'Ошибка сервера', error.message, true);
+    } else {
+      showScreen('retry', 'Нет связи', 'Не удалось связаться с сервером. Проверьте подключение и попробуйте ещё раз.', true);
+    }
+  });
+}
+
+// ------------------------------------------------------------- канвас/кадры
+
+function aspectRatio() {
+  var data = state.data || {};
+  var width = Number(data.width);
+  var height = Number(data.height);
+  if (width > 0 && height > 0) return width / height;
+  var parts = String(data.aspect || '3:2').split(':');
+  var aw = Number(parts[0]);
+  var ah = Number(parts[1]);
+  if (aw > 0 && ah > 0) return aw / ah;
+  var img = state.imgB || state.imgA;
+  if (img && img.naturalWidth && img.naturalHeight) {
+    return img.naturalWidth / img.naturalHeight;
+  }
+  return 3 / 2;
+}
+
+function workspace() {
+  if (!state.imgA || !state.imgB) return;
+  var ratio = aspectRatio();
+  var dpr = Math.max(1, Math.min(window.devicePixelRatio || 1, 3));
+  var stageWidth = stage.clientWidth || window.innerWidth || 320;
+  var stageHeight = stage.clientHeight || window.innerHeight || 320;
+  var screenWidth = (window.screen && window.screen.width) || stageWidth;
+  // Канвас не шире screen.width в CSS-пикселях, то есть не шире screen.width*dpr
+  // в пикселях устройства: тяжёлые оригиналы не раздувают память WebView.
+  var cssWidth = Math.floor(Math.min(stageWidth, stageHeight * ratio, screenWidth));
+  cssWidth = Math.max(120, cssWidth);
+  var pixelWidth = Math.min(Math.round(cssWidth * dpr), Math.floor(screenWidth * dpr));
+  var pixelHeight = Math.max(1, Math.round(pixelWidth / ratio));
+
+  canvas.width = pixelWidth;
+  canvas.height = pixelHeight;
+  canvas.style.width = cssWidth + 'px';
+  canvas.style.height = Math.round(cssWidth / ratio) + 'px';
+
+  state.dpr = dpr;
+  state.cw = pixelWidth;
+  state.ch = pixelHeight;
+  state.iw = state.imgB.naturalWidth || state.imgA.naturalWidth || pixelWidth;
+  state.ih = state.imgB.naturalHeight || state.imgA.naturalHeight || pixelHeight;
+  state.base = Math.max(state.cw / state.iw, state.ch / state.ih);
+  clampPan();
+  draw();
+}
+
+function draw() {
+  var cw = canvas.width;
+  var ch = canvas.height;
+  if (!cw || !ch) return;
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  ctx.clearRect(0, 0, cw, ch);
+  if (!state.imgA || !state.imgB) return;
+
+  var dw = state.iw * state.base * state.zoom;
+  var dh = state.ih * state.base * state.zoom;
+  var x = (cw - dw) / 2 + state.panX;
+  var y = (ch - dh) / 2 + state.panY;
+  var split = Math.round(cw * state.p);
+
+  // «После» целиком, поверх него «До» — только слева от шторки.
+  ctx.imageSmoothingEnabled = true;
+  ctx.imageSmoothingQuality = 'high';
+  ctx.drawImage(state.imgB, x, y, dw, dh);
+  if (split > 0) {
+    ctx.save();
+    ctx.beginPath();
+    ctx.rect(0, 0, split, ch);
+    ctx.clip();
+    ctx.drawImage(state.imgA, x, y, dw, dh);
+    ctx.restore();
+  }
+
+  drawHandle(split, ch);
+  canvas.style.cursor = state.zoom > 1.001 ? 'grab' : 'ew-resize';
+}
+
+function drawHandle(px, ch) {
+  var dpr = state.dpr || 1;
+  var shadow = Math.max(1, Math.round(dpr));
+  var line = Math.max(2, Math.round(2 * dpr));
+  ctx.save();
+
+  // Тёмная подложка и белая линия: видны и на светлом, и на тёмном кадре.
+  ctx.fillStyle = 'rgba(0,0,0,.55)';
+  ctx.fillRect(px - shadow, 0, shadow * 2, ch);
+  ctx.fillStyle = '#ffffff';
+  ctx.fillRect(px - Math.round(line / 2), 0, line, ch);
+
+  var radius = Math.max(16, Math.round(18 * dpr));
+  var cy = ch / 2;
+  ctx.beginPath();
+  ctx.arc(px, cy, radius, 0, Math.PI * 2);
+  ctx.fillStyle = 'rgba(0,0,0,.35)';
+  ctx.fill();
+  ctx.beginPath();
+  ctx.arc(px, cy, radius * 0.92, 0, Math.PI * 2);
+  ctx.fillStyle = '#ffffff';
+  ctx.fill();
+
+  // Двусторонняя стрелка «↔», нарисованная путями: шрифты не нужны.
+  var half = radius * 0.42;
+  var head = radius * 0.26;
+  ctx.strokeStyle = '#2b2b2b';
+  ctx.lineWidth = Math.max(2, Math.round(2 * dpr));
+  ctx.lineCap = 'round';
+  ctx.lineJoin = 'round';
+  ctx.beginPath();
+  ctx.moveTo(px - half, cy);
+  ctx.lineTo(px + half, cy);
+  ctx.moveTo(px - half, cy);
+  ctx.lineTo(px - half + head, cy - head);
+  ctx.moveTo(px - half, cy);
+  ctx.lineTo(px - half + head, cy + head);
+  ctx.moveTo(px + half, cy);
+  ctx.lineTo(px + half - head, cy - head);
+  ctx.moveTo(px + half, cy);
+  ctx.lineTo(px + half - head, cy + head);
+  ctx.stroke();
+  ctx.restore();
+}
+
+// --------------------------------------------------------------- зум и пан
+
+function clampPan() {
+  var dw = state.iw * state.base * state.zoom;
+  var dh = state.ih * state.base * state.zoom;
+  var maxX = Math.max(0, (dw - state.cw) / 2);
+  var maxY = Math.max(0, (dh - state.ch) / 2);
+  state.panX = clamp(state.panX, -maxX, maxX);
+  state.panY = clamp(state.panY, -maxY, maxY);
+  if (state.zoom <= 1.001) {
+    state.panX = 0;
+    state.panY = 0;
+  }
+}
+
+function zoomAt(nextZoom, x, y, basePanX, basePanY) {
+  var oldZoom = state.zoom > 0 ? state.zoom : 1;
+  var dwOld = state.iw * state.base * oldZoom;
+  var dhOld = state.ih * state.base * oldZoom;
+  var offsetX = (state.cw - dwOld) / 2 + basePanX;
+  var offsetY = (state.ch - dhOld) / 2 + basePanY;
+  var u = dwOld ? (x - offsetX) / dwOld : 0.5;
+  var v = dhOld ? (y - offsetY) / dhOld : 0.5;
+
+  state.zoom = clamp(nextZoom, ZOOM_MIN, ZOOM_MAX);
+  var dwNew = state.iw * state.base * state.zoom;
+  var dhNew = state.ih * state.base * state.zoom;
+  state.panX = x - u * dwNew - (state.cw - dwNew) / 2;
+  state.panY = y - v * dhNew - (state.ch - dhNew) / 2;
+  clampPan();
+  draw();
+}
+
+function resetView() {
+  state.zoom = 1;
+  state.panX = 0;
+  state.panY = 0;
+  draw();
+}
+
+function setSplit(value) {
+  state.p = clamp(value, 0, 1);
+  draw();
+}
+
+function localPoint(event) {
+  var rect = canvas.getBoundingClientRect();
+  var scaleX = rect.width ? state.cw / rect.width : 1;
+  var scaleY = rect.height ? state.ch / rect.height : 1;
+  return {
+    x: (event.clientX - rect.left) * scaleX,
+    y: (event.clientY - rect.top) * scaleY,
+    split: rect.width ? (event.clientX - rect.left) / rect.width : 0.5
+  };
+}
+
+function pinchInfo() {
+  var points = [];
+  state.pointers.forEach(function (point) { points.push(point); });
+  var first = points[0];
+  var second = points[1];
+  return {
+    dist: Math.hypot(first.x - second.x, first.y - second.y) || 1,
+    mx: (first.x + second.x) / 2,
+    my: (first.y + second.y) / 2
+  };
+}
+
+function startPinch() {
+  var info = pinchInfo();
+  state.pinch = {
+    dist: info.dist,
+    mx: info.mx,
+    my: info.my,
+    zoom: state.zoom,
+    panX: state.panX,
+    panY: state.panY
+  };
+}
+
+function updatePinch() {
+  var info = pinchInfo();
+  var start = state.pinch;
+  if (!start) return;
+  var next = clamp(start.zoom * (info.dist / start.dist), ZOOM_MIN, ZOOM_MAX);
+  zoomAt(next, start.mx, start.my, start.panX, start.panY);
+  state.panX += info.mx - start.mx;
+  state.panY += info.my - start.my;
+  clampPan();
+  draw();
+}
+
+function canInteract() {
+  return !!(state.imgA && state.imgB) && screenEl.hidden;
+}
+
+function startDrag(point, pointerId) {
+  var nearHandle = Math.abs(point.x - state.cw * state.p) <= DIVIDER_BAND * state.dpr;
+  var panning = state.zoom > 1.001 && !nearHandle;
+  state.mode = panning ? 'pan' : 'split';
+  state.drag = {
+    id: pointerId,
+    x0: point.x,
+    y0: point.y,
+    panX0: state.panX,
+    panY0: state.panY,
+    moved: 0
+  };
+  if (state.mode === 'split') setSplit(point.split);
+}
+
+canvas.addEventListener('pointerdown', function (event) {
+  if (!canInteract()) return;
+  if (event.pointerType === 'mouse' && event.button !== 0) return;
+  event.preventDefault();
+  try { canvas.setPointerCapture(event.pointerId); } catch (err) { /* не критично */ }
+
+  var point = localPoint(event);
+  state.pointers.set(event.pointerId, point);
+
+  if (state.pointers.size === 2) {
+    state.drag = null;
+    state.mode = 'pinch';
+    startPinch();
+    return;
+  }
+  if (state.pointers.size === 1) startDrag(point, event.pointerId);
+}, { passive: false });
+
+canvas.addEventListener('pointermove', function (event) {
+  if (!state.pointers.has(event.pointerId)) return;
+  event.preventDefault();
+  var point = localPoint(event);
+  state.pointers.set(event.pointerId, point);
+
+  if (state.mode === 'pinch' && state.pointers.size >= 2) {
+    updatePinch();
+    return;
+  }
+
+  var drag = state.drag;
+  if (!drag || drag.id !== event.pointerId) return;
+  var dx = point.x - drag.x0;
+  var dy = point.y - drag.y0;
+  drag.moved = Math.max(drag.moved, Math.abs(dx) + Math.abs(dy));
+
+  if (state.mode === 'split') {
+    setSplit(point.split);
+  } else if (state.mode === 'pan') {
+    state.panX = drag.panX0 + dx;
+    state.panY = drag.panY0 + dy;
+    clampPan();
+    draw();
+  }
+}, { passive: false });
+
+function endPointer(event, cancelled) {
+  var point = state.pointers.get(event.pointerId);
+  if (!point) return;
+  var mode = state.mode;
+  var drag = state.drag;
+  state.pointers.delete(event.pointerId);
+  try { canvas.releasePointerCapture(event.pointerId); } catch (err) { /* уже отпущен */ }
+
+  if (state.pointers.size === 1) {
+    // Один палец остался после пинча: продолжаем как пан/шторку без рывка.
+    var remainingId = 0;
+    var remaining = null;
+    state.pointers.forEach(function (value, key) {
+      remainingId = key;
+      remaining = value;
+    });
+    if (remaining) {
+      state.pinch = null;
+      startDrag(remaining, remainingId);
+    }
+    return;
+  }
+  if (state.pointers.size > 0) return;
+
+  var wasTap = drag && drag.id === event.pointerId && drag.moved <= TAP_SLOP * (state.dpr || 1);
+  if (wasTap && !cancelled) {
+    var now = Date.now();
+    if (now - lastTapAt <= DOUBLE_TAP_MS) {
+      lastTapAt = 0;
+      resetView();
+    } else {
+      lastTapAt = now;
+      if (mode === 'pan') setSplit(point.split);
+    }
+  }
+  state.mode = null;
+  state.drag = null;
+  state.pinch = null;
+}
+
+canvas.addEventListener('pointerup', function (event) {
+  endPointer(event, false);
+}, { passive: true });
+
+canvas.addEventListener('pointercancel', function (event) {
+  endPointer(event, true);
+}, { passive: true });
+
+canvas.addEventListener('wheel', function (event) {
+  if (!canInteract()) return;
+  event.preventDefault();
+  var point = localPoint(event);
+  var delta = event.deltaY;
+  if (event.deltaMode === 1) delta *= 16;
+  else if (event.deltaMode === 2) delta *= state.ch || 400;
+  // Ctrl+wheel — это пинч на трекпаде, обычное колесо — тоже зум.
+  var factor = Math.exp(-delta * (event.ctrlKey ? 0.01 : 0.0025));
+  zoomAt(state.zoom * factor, point.x, point.y, state.panX, state.panY);
+}, { passive: false });
+
+canvas.addEventListener('dblclick', function (event) {
+  if (!canInteract()) return;
+  event.preventDefault();
+  resetView();
+});
+
+resetEl.addEventListener('click', function () {
+  resetView();
+});
+
+retryEl.addEventListener('click', function () {
+  retryEl.style.display = 'none';
+  load();
+});
+
+window.addEventListener('keydown', function (event) {
+  if (!canInteract()) return;
+  var step = event.shiftKey ? 0.05 : 0.01;
+  if (event.key === 'ArrowLeft') {
+    setSplit(state.p - step);
+  } else if (event.key === 'ArrowRight') {
+    setSplit(state.p + step);
+  } else if (event.key === '+' || event.key === '=') {
+    zoomAt(state.zoom * 1.25, state.cw / 2, state.ch / 2, state.panX, state.panY);
+  } else if (event.key === '-' || event.key === '_') {
+    zoomAt(state.zoom / 1.25, state.cw / 2, state.ch / 2, state.panX, state.panY);
+  } else if (event.key === '0' || event.key === 'Home') {
+    resetView();
+  } else {
+    return;
+  }
+  event.preventDefault();
+});
+
+// ---------------------------------------------------------------- отрисовка
+
+function onResize() {
+  clearTimeout(resizeTimer);
+  resizeTimer = setTimeout(function () {
+    workspace();
+  }, 80);
+}
+
+window.addEventListener('resize', onResize);
+window.addEventListener('orientationchange', onResize);
+try {
+  if (window.ResizeObserver && stage) {
+    new ResizeObserver(onResize).observe(stage);
+  }
+} catch (err) { /* без ResizeObserver хватает resize */ }
+
+function boot() {
+  try {
+    if (tg) {
+      tg.ready();
+      tg.expand();
+      if (tg.disableVerticalSwipes) tg.disableVerticalSwipes();
+    }
+  } catch (err) { /* страница работает и без Telegram API */ }
+  applyTheme();
+  try {
+    if (tg && tg.onEvent) tg.onEvent('themeChanged', applyTheme);
+  } catch (err) { /* старые клиенты */ }
+  load();
+}
+
+boot();
+})();
+</script>
+</body>
+</html>

@@ -11,10 +11,13 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
+import socket
 from contextlib import suppress
 from io import BytesIO
 from types import SimpleNamespace
 
+import aiohttp
+import pytest
 from PIL import Image
 
 from bot import main as main_module
@@ -176,6 +179,81 @@ async def test_setup_compare_creates_cache_and_configures(tmp_path, monkeypatch)
     # Повторный старт после остановки не падает.
     await main_module.setup_compare()
     await main_module.teardown_compare()
+
+
+async def test_setup_compare_purge_removes_originals(tmp_path, monkeypatch) -> None:
+    """`purge` при старте собирает мусор вместе с файлами оригиналов."""
+    cache = tmp_path / "cmp"
+    monkeypatch.setattr(settings, "cmp_cache_dir", cache)
+
+    # Запись, созданная до старта: при TTL=0 она сразу считается устаревшей.
+    seed = ComparisonStore(cache / "cmp.db")
+    cmp_id = await seed.save(
+        42,
+        image_a=b"a",
+        image_b=b"b",
+        width=100,
+        quality=50,
+        labels=("До", "После"),
+        zlib_bytes=10,
+    )
+    await seed.close()
+
+    removed: list[str] = []
+    monkeypatch.setattr(
+        main_module.originals,
+        "remove",
+        lambda cache_dir, cmp_id: removed.append(cmp_id),
+    )
+    monkeypatch.setattr(settings, "cmp_cache_ttl_days", 0)
+
+    await main_module.setup_compare()
+    try:
+        assert removed == [cmp_id], "originals.remove должен дойти до удалённого номера"
+        assert await service_module.get_store().count() == 0
+    finally:
+        await main_module.teardown_compare()
+
+
+async def test_setup_webapp_disabled_when_port_zero(monkeypatch) -> None:
+    """`CMP_WEBAPP_PORT=0` — сервер не поднимается, поведение бота прежнее."""
+    monkeypatch.setattr(settings, "cmp_webapp_port", 0)
+    assert await main_module.setup_webapp() is None
+    # Гашение `None` (сервер не стартовал) безопасно.
+    await main_module.teardown_webapp(None)
+
+
+def _free_port() -> int:
+    """Свободный порт loopback: bind(0) → номер → закрыть сокет."""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind(("127.0.0.1", 0))
+        return int(sock.getsockname()[1])
+
+
+async def test_setup_webapp_serves_healthz_and_stops(tmp_path, monkeypatch) -> None:
+    """Свободный порт: `setup_webapp` поднимает сервер, `/healthz` отвечает, teardown гасит."""
+    monkeypatch.setattr(settings, "cmp_cache_dir", tmp_path / "cmp")
+    port = _free_port()
+    monkeypatch.setattr(settings, "cmp_webapp_port", port)
+    monkeypatch.setattr(settings, "cmp_webapp_host", "127.0.0.1")
+
+    await main_module.setup_compare()
+    runner = await main_module.setup_webapp()
+    try:
+        assert runner is not None
+        async with aiohttp.ClientSession() as session:
+            async with session.get(f"http://127.0.0.1:{port}/healthz") as response:
+                assert response.status == 200
+                assert await response.text() == "ok"
+    finally:
+        await main_module.teardown_webapp(runner)
+        await main_module.teardown_webapp(runner)  # повторный teardown безопасен
+        await main_module.teardown_compare()
+
+    # После остановки порт больше не слушается.
+    with pytest.raises(OSError):
+        _, writer = await asyncio.open_connection("127.0.0.1", port)
+        writer.close()
 
 
 async def test_teardown_compare_is_safe_without_setup() -> None:

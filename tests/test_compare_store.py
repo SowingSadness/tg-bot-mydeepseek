@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import re
 import sqlite3
 from pathlib import Path
@@ -175,6 +176,36 @@ async def test_purge_zero_ttl_removes_everything(store: ComparisonStore):
     removed = await store.purge(ttl_seconds=0, max_entries=100)
 
     assert removed == 3
+    assert await store.count() == 0
+
+
+async def test_purge_calls_on_removed_for_each_deleted_id(store: ComparisonStore):
+    """`on_removed` получает каждый удалённый номер: по нему чистятся файлы оригиналов."""
+    ids = [await _save(store, now=100.0 + index) for index in range(3)]
+    seen: list[str] = []
+
+    removed = await store.purge(ttl_seconds=0, max_entries=100, on_removed=seen.append)
+
+    assert removed == 3
+    assert sorted(seen) == sorted(ids)
+    assert await store.count() == 0
+
+
+async def test_purge_survives_callback_error(store: ComparisonStore, caplog):
+    """Исключение в `on_removed` — warning, purge дочищает остальные и не падает."""
+    ids = [await _save(store, now=100.0 + index) for index in range(3)]
+    seen: list[str] = []
+
+    def boom(cmp_id: str) -> None:
+        seen.append(cmp_id)
+        raise RuntimeError("disk is on fire")
+
+    with caplog.at_level(logging.WARNING, logger="bot.compare.store"):
+        removed = await store.purge(ttl_seconds=0, max_entries=100, on_removed=boom)
+
+    assert removed == 3
+    assert sorted(seen) == sorted(ids)
+    assert "disk is on fire" in caplog.text
     assert await store.count() == 0
 
 

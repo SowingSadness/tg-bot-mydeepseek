@@ -1,9 +1,10 @@
-"""Композит-превью «A|B» для inline-фото: два кадра рядом, разделитель и подписи.
+"""Композит-превью «до/после» для inline-фото: половина сцены до + половина после.
 
-Превью должно показывать **то же**, что и шторка в бабле: обе картинки режутся
-по одному окну `fit_box(img_a, aspect)` (окно считается по первой картинке и
-применяется к обеим — как в `build.build`), поэтому расхождение с баблом
-возможно только по масштабу, но не по участку сцены.
+Композит — одна сцена в пропорциях `aspect` (по умолчанию 3:2): левая половина
+берётся из левых 50% кадра «До», правая — из правых 50% кадра «После». Оба кадра
+режутся по одному окну `fit_box(img_a, aspect)` (окно считается по первой картинке
+и применяется к обеим — как в `build.build`), поэтому участок сцены тот же, что у
+слоёв бабла, а меняется только то, какие половины кадров попадают в композит.
 
 Модуль не импортирует `bot.config`: ширина, пропорции и подписи приходят
 аргументами. Подписи рисуются best-effort: если TTF-шрифта с кириллицей нет,
@@ -75,13 +76,12 @@ def _aspect_pair(aspect) -> tuple[int, int]:
 
 
 def size_for(width: int, aspect="3:2") -> tuple[int, int]:
-    """`(ширина композита, высота)` для общей `width`: половина — на каждый кадр."""
+    """`(ширина, высота)` композита: одна сцена `width`×`round(width * ah/aw)`."""
     width = int(width)
     if width < 2:
         raise ImageError("Ширина превью должна быть хотя бы 2 пикселя.")
     aw, ah = _aspect_pair(aspect)
-    half = width // 2
-    return half * 2, max(1, round(half * ah / aw))
+    return width, max(1, round(width * ah / aw))
 
 
 def _find_font(size: int) -> ImageFont.FreeTypeFont | None:
@@ -158,11 +158,12 @@ def render(
     labels: tuple[str, str] = ("До", "После"),
     quality: int = 85,
 ) -> bytes:
-    """Собирает композит «A|B» и возвращает JPEG-байты.
+    """Собирает композит «левые 50% A | правые 50% B» и возвращает JPEG-байты.
 
     Каждый кадр — полный кадр исходника, обрезанный по общему окну
-    `fit_box(img_a, aspect)` и приведённый к `aspect` (как слои бабла).
-    `width` — общая ширина композита, каждый кадр получает `width // 2`.
+    `fit_box(img_a, aspect)` и приведённый к размеру композита (как слои бабла).
+    В композит идут только левые 50% кадра A и правые 50% кадра B: одна сцена,
+    у которой левая половина «до», правая — «после». `width` — ширина композита.
     """
     total_width, height = size_for(width, aspect)
     half = total_width // 2
@@ -173,12 +174,12 @@ def render(
 
     # Окно считается по первой картинке и применяется к обеим — тот же участок сцены.
     window = fit_box(img_a, (aw, ah))
-    frame_a = crop(img_a, window).resize((half, height), Image.LANCZOS)
-    frame_b = crop(img_b, window).resize((half, height), Image.LANCZOS)
+    fitted_a = crop(img_a, window).resize((total_width, height), Image.LANCZOS)
+    fitted_b = crop(img_b, window).resize((total_width, height), Image.LANCZOS)
 
     canvas = Image.new("RGB", (total_width, height), WHITE)
-    canvas.paste(frame_a, (0, 0))
-    canvas.paste(frame_b, (half, 0))
+    canvas.paste(fitted_a.crop((0, 0, half, height)), (0, 0))
+    canvas.paste(fitted_b.crop((half, 0, total_width, height)), (half, 0))
 
     try:
         label_a, label_b = (str(labels[0]), str(labels[1])) if labels else ("", "")
@@ -187,7 +188,7 @@ def render(
     try:  # подписи — украшение: любая беда со шрифтом не должна ломать превью
         draw = ImageDraw.Draw(canvas, "RGBA")
         _draw_label(draw, label_a, (0, 0), (half, height), align_right=False)
-        _draw_label(draw, label_b, (half, 0), (half, height), align_right=True)
+        _draw_label(draw, label_b, (half, 0), (total_width - half, height), align_right=True)
     except Exception as exc:  # noqa: BLE001 — best-effort, без падения
         log.debug("Подписи превью не нарисованы: %s", exc)
     _draw_divider(canvas, half)

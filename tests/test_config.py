@@ -33,11 +33,17 @@ EXPECTED_DEFAULTS: dict[str, object] = {
     "cmp_show_hint": True,
     "cmp_allow_private_hosts": False,
     "cmp_labels": "До|После",
-    "cmp_caption": "Сравнение #{id} · {a} / {b}",
+    "cmp_caption": "Номер сравнения:\n@{bot} #{id}",
     "cmp_title": "Сравнение",
     "cmp_hint": "Проведите ↔",
     "cmp_webapp_short_name": "",
     "cmp_preview_width": 2560,
+    # Шаг 7: мини-апп /app/cmp, оригиналы и срок жизни initData.
+    "cmp_webapp_port": 0,
+    "cmp_webapp_host": "127.0.0.1",
+    "cmp_webapp_public_url": "",
+    "cmp_originals_width": 1600,
+    "cmp_webapp_auth_ttl": 86400,
 }
 
 NEW_FIELDS = ("cmp_cache_dir", *EXPECTED_DEFAULTS)
@@ -50,7 +56,7 @@ def _env_example_keys() -> set[str]:
 
 
 def test_all_new_fields_declared() -> None:
-    assert len(NEW_FIELDS) == 23
+    assert len(NEW_FIELDS) == 28
     missing = [name for name in NEW_FIELDS if name not in Settings.model_fields]
     assert not missing, f"в Settings нет полей: {missing}"
 
@@ -145,12 +151,72 @@ def test_template_placeholders() -> None:
     assert "touch-action: pan-y" in html
 
 
+def test_caption_default_is_two_lines() -> None:
+    """Подпись по умолчанию: заголовок и `@бот #номер` отдельной строкой."""
+    caption = _settings().cmp_caption
+    assert caption == "Номер сравнения:\n@{bot} #{id}"
+    assert caption.splitlines() == ["Номер сравнения:", "@{bot} #{id}"]
+    assert caption.format(id="482913", bot="test_bot") == (
+        "Номер сравнения:\n@test_bot #482913"
+    )
+
+
+def test_env_example_caption_keeps_hash_and_newline(tmp_path) -> None:
+    """`CMP_CAPTION` в двойных кавычках: dotenv не режет по `#` и раскрывает `\\n`."""
+    line = 'CMP_CAPTION="Номер сравнения:\\n@{bot} #{id}"'
+    assert line in ENV_EXAMPLE.read_text(encoding="utf-8")
+
+    env_file = tmp_path / ".env"
+    env_file.write_text(line + "\n", encoding="utf-8")
+    loaded = Settings(
+        _env_file=env_file,
+        telegram_bot_token="123:test",
+        deepseek_api_key="sk-test",
+        bot_username="test_bot",
+    )
+    assert loaded.cmp_caption == "Номер сравнения:\n@{bot} #{id}"
+    assert loaded.cmp_caption.splitlines() == ["Номер сравнения:", "@{bot} #{id}"]
+    assert loaded.cmp_caption.format(id="482913", bot="test_bot") == (
+        "Номер сравнения:\n@test_bot #482913"
+    )
+
+
 def test_env_example_has_all_new_keys() -> None:
     keys = _env_example_keys()
     missing = sorted({name.upper() for name in NEW_FIELDS} - keys)
     assert not missing, f"в .env.example нет: {missing}"
     # Переменные альбомного флоу и пропорций бабла документированы явно.
     assert {"CMP_ALBUM_WAIT", "CMP_ASPECT"} <= keys
+    # Мини-апп: по умолчанию выключен, но порт/хост/адрес/оригиналы/TTL есть в шаблоне.
+    assert {
+        "CMP_WEBAPP_PORT",
+        "CMP_WEBAPP_HOST",
+        "CMP_WEBAPP_PUBLIC_URL",
+        "CMP_ORIGINALS_WIDTH",
+        "CMP_WEBAPP_AUTH_TTL",
+    } <= keys
+
+
+def test_webapp_fields_defaults_and_override() -> None:
+    """Мини-апп выключен по умолчанию и настраивается через окружение/аргументы."""
+    assert _settings().cmp_webapp_port == 0
+    assert _settings().cmp_webapp_host == "127.0.0.1"
+    assert _settings().cmp_webapp_public_url == ""
+    assert _settings().cmp_originals_width == 1600
+    assert _settings().cmp_webapp_auth_ttl == 86400
+
+    tuned = _settings(
+        cmp_webapp_port=8081,
+        cmp_webapp_host="0.0.0.0",
+        cmp_webapp_public_url="https://example.com/app/cmp",
+        cmp_originals_width=2000,
+        cmp_webapp_auth_ttl=3600,
+    )
+    assert tuned.cmp_webapp_port == 8081
+    assert tuned.cmp_webapp_host == "0.0.0.0"
+    assert tuned.cmp_webapp_public_url == "https://example.com/app/cmp"
+    assert tuned.cmp_originals_width == 2000
+    assert tuned.cmp_webapp_auth_ttl == 3600
 
 
 def test_env_example_log_level_is_error() -> None:

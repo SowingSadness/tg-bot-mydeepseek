@@ -10,6 +10,10 @@ COPY requirements.txt ./
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY bot ./bot
+# В `bot/` лежит и статика мини-аппа (`bot/webapp/static/cmp.html`) — отдельная COPY не нужна.
+
+# Порт HTTP-сервера мини-аппа (/app/cmp). Поднимается только при CMP_WEBAPP_PORT > 0.
+EXPOSE 8081
 
 # Каталог кеша сравнений (/cmp) принадлежит рабочему пользователю: /app создан от root.
 RUN useradd --create-home --shell /usr/sbin/nologin botuser \
