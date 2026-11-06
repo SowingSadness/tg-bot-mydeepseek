@@ -1,4 +1,4 @@
-"""Картинки для сравнения: декод, EXIF, центральный кроп 4:3, WebP и скачивание по ссылке.
+"""Картинки для сравнения: декод, EXIF, кроп под кадр 3:2 (настраивается через CMP_ASPECT), WebP и скачивание по ссылке.
 
 Модуль не зависит от `bot.config`: все лимиты и таймауты приходят аргументами, поэтому
 его удобно тестировать без сети и окружения.
@@ -14,13 +14,25 @@ from io import BytesIO
 from urllib.parse import urljoin, urlsplit
 
 import aiohttp
-from PIL import Image, ImageOps, UnidentifiedImageError
+from PIL import Image, ImageChops, ImageFilter, ImageOps, ImageStat, UnidentifiedImageError
 
 # Больше 40 Мп не декодируем: и память, и время, а для бабла всё равно нужно ~430 px.
 MAX_PIXELS = 40_000_000
 WEBP_PREFIX = "data:image/webp;base64,"
-# Ширина/высота бабла: картинки всегда кропаются под 4:3.
-ASPECT_W, ASPECT_H = 4, 3
+JPEG_PREFIX = "data:image/jpeg;base64,"
+# Пропорции бабла: 3:2 (на 11% меньше пикселей, чем 4:3, при той же ширине).
+ASPECT = (3, 2)
+# Совместимость: снаружи могли использовать отдельные константы.
+ASPECT_W, ASPECT_H = ASPECT
+
+#: Профили энкодера, которые перебирает сборщик.
+PROFILES = ("webp-lossy", "webp-quant", "jpeg")
+#: Препроцессинг после ресайза: лёгкий unsharp, чтобы превью не выглядело мылом.
+SHARPEN_RADIUS = 0.8
+SHARPEN_PERCENT = 60
+SHARPEN_THRESHOLD = 2
+#: Режим soft: гауссово размытие ДО ресайза для шумных фото (экономим байты).
+SOFT_BLUR = 0.4
 # Сколько редиректов проходим вручную, проверяя хост на каждом шаге.
 MAX_REDIRECTS = 3
 _CHUNK_SIZE = 64 * 1024
@@ -65,31 +77,144 @@ def load(data: bytes) -> Image.Image:
 
 
 def webp_data_url(blob: bytes) -> str:
-    """Сырые WebP-байты → `data:image/webp;base64,...` для `src` в шаблоне."""
-    return WEBP_PREFIX + base64.b64encode(blob).decode("ascii")
+    """Байты WebP/JPEG → `data:` URL для `src` в шаблоне.
+
+    Историческое имя оставлено: `build.render_cached` не знает профиль из кеша,
+    поэтому формат определяется по сигнатуре байтов (WebP — по умолчанию).
+    """
+    prefix = JPEG_PREFIX if blob[:2] == b"\xff\xd8" else WEBP_PREFIX
+    return prefix + base64.b64encode(blob).decode("ascii")
 
 
-def to_webp(img: Image.Image, width: int, quality: int) -> tuple[str, bytes]:
-    """Центр-кроп под 4:3, ресайз ровно в `(width, round(width*3/4))` и WebP.
+def fit_box(
+    img: Image.Image,
+    aspect: tuple[int, int] = ASPECT,
+    centering: tuple[float, float] = (0.5, 0.5),
+) -> tuple[float, float, float, float]:
+    """Окно кропа под `aspect` в ДОЛЯХ исходника: `(left, top, right, bottom)`.
 
-    Возвращает `(data-URL, сырые байты)`: data-URL идёт в HTML, байты — в кеш.
+    Ресайза нет: если исходник шире нужного AR — режутся бока, если уже — верх/низ.
+    Окно центрируется по `centering` (0..1 по каждой оси) и всегда лежит в 0..1.
+    """
+    aw, ah = (int(part) for part in aspect)
+    if aw <= 0 or ah <= 0:
+        raise ImageError("Пропорции картинки заданы неверно.")
+    width, height = img.size
+    if width <= 0 or height <= 0:
+        raise ImageError("У картинки нулевой размер.")
+
+    cx = min(1.0, max(0.0, float(centering[0])))
+    cy = min(1.0, max(0.0, float(centering[1])))
+    source_ar = width / height
+    target_ar = aw / ah
+
+    if source_ar > target_ar:  # шире нужного — режем бока
+        fraction = target_ar / source_ar
+        left = cx * (1.0 - fraction)
+        return (left, 0.0, left + fraction, 1.0)
+    if source_ar < target_ar:  # уже нужного — режем верх/низ
+        fraction = source_ar / target_ar
+        top = cy * (1.0 - fraction)
+        return (0.0, top, 1.0, top + fraction)
+    return (0.0, 0.0, 1.0, 1.0)
+
+
+def crop(img: Image.Image, box: tuple[float, float, float, float]) -> Image.Image:
+    """Вырезает окно, заданное долями (`fit_box`), минимум в 1 пиксель."""
+    width, height = img.size
+    left = min(width - 1, max(0, int(round(box[0] * width))))
+    top = min(height - 1, max(0, int(round(box[1] * height))))
+    right = min(width, max(left + 1, int(round(box[2] * width))))
+    bottom = min(height, max(top + 1, int(round(box[3] * height))))
+    return img.crop((left, top, right, bottom))
+
+
+def _mean_abs_error(reference: Image.Image, decoded: Image.Image) -> float:
+    """Средняя абсолютная разница по каналам, нормированная в 0..1."""
+    if decoded.mode != "RGB":
+        decoded = decoded.convert("RGB")
+    diff = ImageChops.difference(reference, decoded)
+    means = ImageStat.Stat(diff).mean
+    return sum(means) / len(means) / 255.0
+
+
+def _encode(img: Image.Image, quality: int, profile: str) -> bytes:
+    """Кодирует готовое превью в выбранный профиль (без новых зависимостей)."""
+    buffer = BytesIO()
+    if profile == "webp-quant":
+        colors = 128 if quality >= 30 else 64
+        quantized = img.quantize(colors=colors)
+        quantized.save(buffer, format="WEBP", lossless=True)
+    elif profile == "jpeg":
+        img.save(
+            buffer,
+            format="JPEG",
+            quality=int(quality),
+            subsampling=2,
+            optimize=True,
+        )
+    else:  # webp-lossy (и старое имя "lossy")
+        img.save(
+            buffer,
+            format="WEBP",
+            quality=int(quality),
+            method=6,
+            smart_subsample=True,
+        )
+    return buffer.getvalue()
+
+
+def to_webp(
+    img: Image.Image,
+    width: int,
+    quality: int,
+    *,
+    box: tuple[float, float, float, float] | None = None,
+    aspect: tuple[int, int] = ASPECT,
+    profile: str = "lossy",
+    soft: bool = False,
+) -> tuple[str, bytes, float]:
+    """Кроп по окну → ресайз в AR → препроцессинг → энкод → метрика искажения.
+
+    `box` — доли исходника (общие для обеих картинок); `None` — `fit_box(img, aspect)`.
+    Возвращает `(data-URL, сырые байты, ошибка 0..1)`: URL идёт в HTML, байты — в кеш.
     """
     width = int(width)
     if width < 1:
         raise ImageError("Ширина картинки должна быть положительной.")
-    height = max(1, round(width * ASPECT_H / ASPECT_W))
+
+    aw, ah = (int(part) for part in aspect)
+    if aw <= 0 or ah <= 0:
+        raise ImageError("Пропорции картинки заданы неверно.")
+    height = max(1, round(width * ah / aw))
+
+    name = "webp-lossy" if profile == "lossy" else str(profile)
+    if name not in PROFILES:
+        raise ImageError(f"Неизвестный профиль сжатия: {profile}.")
+
+    window = fit_box(img, aspect) if box is None else box
 
     try:
-        fitted = ImageOps.fit(img, (width, height), method=Image.LANCZOS, centering=(0.5, 0.5))
-        buffer = BytesIO()
-        fitted.save(buffer, format="WEBP", quality=int(quality), method=6)
+        cropped = crop(img, window)
+        if soft:
+            cropped = cropped.filter(ImageFilter.GaussianBlur(SOFT_BLUR))
+        fitted = cropped.resize((width, height), Image.LANCZOS)
+        fitted = fitted.filter(
+            ImageFilter.UnsharpMask(
+                radius=SHARPEN_RADIUS,
+                percent=SHARPEN_PERCENT,
+                threshold=SHARPEN_THRESHOLD,
+            )
+        )
+        blob = _encode(fitted, int(quality), name)
+        decoded = Image.open(BytesIO(blob)).convert("RGB")
     except (OSError, ValueError) as exc:
         raise ImageError("Не удалось сжать картинку в WebP.") from exc
 
-    blob = buffer.getvalue()
     if not blob:
         raise ImageError("Не удалось сжать картинку в WebP: получился пустой файл.")
-    return webp_data_url(blob), blob
+    error = _mean_abs_error(fitted.convert("RGB"), decoded)
+    return webp_data_url(blob), blob, error
 
 
 def _is_public_ip(value: str) -> bool:

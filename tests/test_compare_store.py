@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+import sqlite3
 from pathlib import Path
 
 import pytest
@@ -31,6 +32,7 @@ async def _save(
     now: float | None = None,
     image_a: bytes = IMAGE_A,
     image_b: bytes = IMAGE_B,
+    aspect: str = "3:2",
 ) -> str:
     return await store.save(
         owner_id,
@@ -40,6 +42,7 @@ async def _save(
         quality=34,
         labels=LABELS,
         zlib_bytes=1024,
+        aspect=aspect,
         now=now,
     )
 
@@ -74,6 +77,16 @@ async def test_reopen_finds_identical_record(tmp_path: Path):
     assert cached.zlib_bytes == 1024
     assert cached.image_a == IMAGE_A
     assert cached.image_b == IMAGE_B
+    assert cached.aspect == "3:2"
+
+
+async def test_aspect_round_trips(store: ComparisonStore):
+    cmp_id = await _save(store, aspect="4:3")
+
+    cached = await store.get(cmp_id)
+
+    assert cached is not None
+    assert cached.aspect == "4:3"
 
 
 async def test_get_filters_by_owner(store: ComparisonStore):
@@ -148,6 +161,77 @@ async def test_id_collision_grows_number_after_ten_tries(store: ComparisonStore,
     assert second == "1000000"
     assert len(second) == 7
     assert await store.count() == 2
+
+
+async def test_save_defaults_aspect_to_3_2(store: ComparisonStore):
+    """Без явного `aspect` новая запись получает дефолт 3:2 (текущий AR бабла)."""
+    cmp_id = await store.save(
+        7,
+        image_a=IMAGE_A,
+        image_b=IMAGE_B,
+        width=430,
+        quality=34,
+        labels=LABELS,
+        zlib_bytes=1024,
+    )
+
+    cached = await store.get(cmp_id)
+
+    assert cached is not None
+    assert isinstance(cached.aspect, str)
+    assert cached.aspect == "3:2"
+
+
+async def test_migrates_old_database_without_aspect(tmp_path: Path):
+    """Старая БД без колонки `aspect`: ALTER TABLE без заполнения, чтение → 4:3."""
+    path = tmp_path / "old.db"
+    conn = sqlite3.connect(str(path))
+    try:
+        conn.executescript(
+            """
+            CREATE TABLE comparisons (
+              id TEXT PRIMARY KEY, owner_id INTEGER NOT NULL, created_at REAL NOT NULL,
+              width INTEGER NOT NULL, quality INTEGER NOT NULL, labels TEXT NOT NULL,
+              zlib_bytes INTEGER NOT NULL, image_a BLOB NOT NULL, image_b BLOB NOT NULL
+            );
+            """
+        )
+        conn.execute(
+            "INSERT INTO comparisons VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            ("482913", 7, 100.0, 430, 34, "До|После", 1024, IMAGE_A, IMAGE_B),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    store = ComparisonStore(path)
+    try:
+        cached = await store.get("482913")
+        assert cached is not None
+        # Миграция не выдумывает AR: старые строки запечены в 4:3 и читаются так же.
+        assert cached.aspect == "4:3"
+        assert isinstance(cached.aspect, str)
+        assert cached.image_a == IMAGE_A
+
+        # Новые записи без aspect берут дефолт save → 3:2.
+        fresh_id = await store.save(
+            7,
+            image_a=IMAGE_A,
+            image_b=IMAGE_B,
+            width=430,
+            quality=34,
+            labels=LABELS,
+            zlib_bytes=1024,
+        )
+        fresh = await store.get(fresh_id)
+        assert fresh is not None and fresh.aspect == "3:2"
+
+        # После миграции явный aspect тоже работает.
+        legacy_id = await _save(store, aspect="4:3")
+        legacy = await store.get(legacy_id)
+        assert legacy is not None and legacy.aspect == "4:3"
+    finally:
+        await store.close()
 
 
 async def test_creates_missing_directories(tmp_path: Path):

@@ -1,4 +1,4 @@
-"""Тесты картинок: декод/EXIF, центр-кроп 4:3, WebP и скачивание по ссылке. Без сети."""
+"""Тесты картинок: декод/EXIF, общее окно кропа 3:2, WebP/JPEG и скачивание. Без сети."""
 
 from __future__ import annotations
 
@@ -6,10 +6,18 @@ import base64
 from io import BytesIO
 
 import pytest
-from PIL import Image
+from PIL import Image, ImageDraw
 
 from bot.compare import images
-from bot.compare.images import ImageError, download_url, load, to_webp, webp_data_url
+from bot.compare.images import (
+    ImageError,
+    crop,
+    download_url,
+    fit_box,
+    load,
+    to_webp,
+    webp_data_url,
+)
 
 PUBLIC_IP = "93.184.216.34"  # бывший адрес example.com, публичный
 
@@ -23,10 +31,13 @@ def _png(img: Image.Image) -> bytes:
     return buffer.getvalue()
 
 
-def _dot_png(width: int = 1000, height: int = 500) -> bytes:
-    """Чёрная картинка с одной белой точкой ровно в центре."""
+def _dot_png(width: int = 1000, height: int = 500, *, x: int | None = None, y: int | None = None) -> bytes:
+    """Чёрная картинка с белым квадратом (по умолчанию ровно в центре)."""
     img = Image.new("RGB", (width, height), "black")
-    img.putpixel((width // 2, height // 2), (255, 255, 255))
+    cx = width // 2 if x is None else x
+    cy = height // 2 if y is None else y
+    half = max(2, min(width, height) // 40)
+    ImageDraw.Draw(img).rectangle((cx - half, cy - half, cx + half, cy + half), fill="white")
     return _png(img)
 
 
@@ -44,6 +55,24 @@ def _brightest(img: Image.Image) -> tuple[int, int]:
             if value > best[0]:
                 best = (value, x, y)
     return best[1], best[2]
+
+
+def _bright_center(img: Image.Image, threshold: int = 200) -> tuple[float, float]:
+    """Центр масс ярких пикселей: у залитого квадрата `_brightest` берёт его угол."""
+    pixels = img.load()
+    width, height = img.size
+    total = 0
+    sx = sy = 0
+    for y in range(height):
+        for x in range(width):
+            brightness = sum(pixels[x, y]) / 3
+            if brightness >= threshold:
+                weight = int(brightness)
+                total += weight
+                sx += x * weight
+                sy += y * weight
+    assert total, "в картинке нет ярких пикселей"
+    return sx / total, sy / total
 
 
 # --------------------------------------------------------------------------- load
@@ -87,41 +116,152 @@ def test_load_rejects_too_many_pixels(monkeypatch):
         load(_png(Image.new("RGB", (20, 20), "white")))
 
 
+# --------------------------------------------------------------------------- fit_box / crop
+
+
+def test_fit_box_crops_sides_of_wide_source():
+    box = fit_box(Image.new("RGB", (1000, 500), "white"), (3, 2))
+
+    assert box == pytest.approx((0.125, 0.0, 0.875, 1.0))
+
+
+def test_fit_box_crops_top_bottom_of_tall_source():
+    box = fit_box(Image.new("RGB", (500, 500), "white"), (3, 2))
+
+    assert box == pytest.approx((0.0, 1 / 6, 1.0, 5 / 6))
+
+
+def test_fit_box_keeps_native_aspect_untouched():
+    assert fit_box(Image.new("RGB", (900, 600), "white"), (3, 2)) == (0.0, 0.0, 1.0, 1.0)
+
+
+def test_fit_box_honours_centering():
+    img = Image.new("RGB", (1000, 500), "white")
+
+    left = fit_box(img, (3, 2), centering=(0.0, 0.5))
+    right = fit_box(img, (3, 2), centering=(1.0, 0.5))
+
+    assert left[0] == pytest.approx(0.0)
+    assert left[2] == pytest.approx(0.75)
+    assert right[2] == pytest.approx(1.0)
+    assert right[0] == pytest.approx(0.25)
+
+
+def test_crop_uses_fractions():
+    img = Image.new("RGB", (1000, 500), "white")
+
+    assert crop(img, (0.1, 0.0, 0.5, 1.0)).size == (400, 500)
+    assert crop(img, (0.0, 0.0, 1.0, 1.0)).size == (1000, 500)
+
+
 # --------------------------------------------------------------------------- to_webp
 
 
-def test_to_webp_center_crops_under_4_3():
-    """Из 1000×500 белая точка в центре попадает в (200,150) после кропа в 400×300."""
-    blob = to_webp(load(_dot_png(1000, 500)), 400, 30)[1]
+def test_to_webp_center_crops_under_3_2():
+    """Из 1000×500 белая метка в центре попадает в (150,100) после кропа в 300×200."""
+    url, blob, error = to_webp(load(_dot_png(1000, 500)), 300, 80)
     decoded = _decode_webp(blob)
 
-    assert decoded.size == (400, 300)
-    x, y = _brightest(decoded)
-    assert abs(x - 200) <= 1, f"ярчайший пиксель по X: {x}"
-    assert abs(y - 150) <= 1, f"ярчайший пиксель по Y: {y}"
+    assert decoded.size == (300, 200)
+    x, y = _bright_center(decoded)
+    assert abs(x - 150) <= 1, f"ярчайший пиксель по X: {x}"
+    assert abs(y - 100) <= 1, f"ярчайший пиксель по Y: {y}"
+    assert 0.0 <= error <= 1.0
+    assert url.startswith("data:image/webp;base64,")
 
 
-def test_to_webp_size_is_exactly_4_3():
+def test_to_webp_size_is_exactly_3_2():
     img = Image.new("RGB", (900, 700), "white")
-    for width in (400, 160):
-        url, blob = to_webp(img, width, 30)
+    for width in (300, 150):
+        url, blob, _ = to_webp(img, width, 30)
         decoded = _decode_webp(blob)
-        assert decoded.size[0] * 3 == decoded.size[1] * 4
-        assert decoded.size == (width, round(width * 3 / 4))
+        assert decoded.size[0] * 2 == decoded.size[1] * 3
+        assert decoded.size == (width, round(width * 2 / 3))
         assert url == webp_data_url(blob)
 
 
 def test_to_webp_returns_data_url_and_webp_bytes():
-    url, blob = to_webp(Image.new("RGB", (800, 600), "teal"), 200, 34)
+    url, blob, error = to_webp(Image.new("RGB", (800, 600), "teal"), 200, 34)
 
     assert url.startswith("data:image/webp;base64,")
     assert base64.b64decode(url.split(",", 1)[1]) == blob
     assert blob[:4] == b"RIFF" and blob[8:12] == b"WEBP"
+    assert error == pytest.approx(0.0, abs=0.01)
+
+
+def test_to_webp_jpeg_profile_returns_jpeg_data_url():
+    url, blob, error = to_webp(Image.new("RGB", (800, 600), "teal"), 120, 40, profile="jpeg")
+
+    assert url.startswith("data:image/jpeg;base64,")
+    assert blob[:2] == b"\xff\xd8"
+    assert _decode_webp(blob).size == (120, 80)
+    assert 0.0 <= error <= 1.0
+
+
+def test_to_webp_quant_profile_is_lossless_webp():
+    url, blob, error = to_webp(Image.new("RGB", (400, 300), "teal"), 150, 30, profile="webp-quant")
+
+    assert url.startswith("data:image/webp;base64,")
+    assert blob[:4] == b"RIFF" and blob[8:12] == b"WEBP"
+    assert _decode_webp(blob).size == (150, 100)
+    assert 0.0 <= error <= 0.05
+
+
+def test_to_webp_soft_mode_saves_bytes_on_noise():
+    noise = Image.effect_noise((400, 300), 64).convert("RGB")
+
+    _, hard, _ = to_webp(noise, 200, 40)
+    _, soft, _ = to_webp(noise, 200, 40, soft=True)
+
+    assert len(soft) < len(hard)
+
+
+def test_to_webp_default_box_equals_explicit_fit_box():
+    img = load(_dot_png(1000, 500))
+    box = fit_box(img, images.ASPECT)
+
+    assert to_webp(img, 300, 60)[1] == to_webp(img, 300, 60, box=box)[1]
+
+
+def test_shared_crop_box_keeps_marker_centered_in_both_sources():
+    """Одинаковое окно (доли) для 2000×800 и 1200×800: центр остаётся центром."""
+    source_a = load(_dot_png(2000, 800))
+    source_b = load(_dot_png(1200, 800))
+    box = fit_box(source_a, images.ASPECT)
+
+    decoded_a = _decode_webp(to_webp(source_a, 300, 80, box=box)[1])
+    decoded_b = _decode_webp(to_webp(source_b, 300, 80, box=box)[1])
+
+    assert decoded_a.size == decoded_b.size == (300, 200)
+    for decoded in (decoded_a, decoded_b):
+        x, y = _bright_center(decoded)
+        assert abs(x - 150) <= 1, f"метка по X: {x}"
+        assert abs(y - 100) <= 1, f"метка по Y: {y}"
+
+
+def test_shared_crop_box_maps_same_fraction_to_same_place():
+    """Точка на одной и той же доле окна попадает в одно и то же место результата."""
+    source_a = load(_dot_png(2000, 800, x=600))  # 0.3 ширины
+    source_b = load(_dot_png(1200, 800, x=360))  # те же 0.3 ширины
+    box = fit_box(source_a, images.ASPECT)  # (0.2, 0, 0.8, 1)
+
+    decoded_a = _decode_webp(to_webp(source_a, 300, 80, box=box)[1])
+    decoded_b = _decode_webp(to_webp(source_b, 300, 80, box=box)[1])
+
+    coords = [_bright_center(decoded) for decoded in (decoded_a, decoded_b)]
+    assert abs(coords[0][0] - 50) <= 1, coords
+    assert abs(coords[1][0] - 50) <= 1, coords
+    assert abs(coords[0][1] - coords[1][1]) <= 1
 
 
 def test_to_webp_rejects_zero_width():
     with pytest.raises(ImageError):
         to_webp(Image.new("RGB", (10, 10), "white"), 0, 30)
+
+
+def test_to_webp_rejects_unknown_profile():
+    with pytest.raises(ImageError, match="профиль"):
+        to_webp(Image.new("RGB", (10, 10), "white"), 10, 30, profile="bmp")
 
 
 def test_webp_data_url_is_base64_of_blob():
@@ -239,7 +379,7 @@ async def test_download_url_reads_200(monkeypatch):
     )
 
     assert data == webp
-    assert _decode_webp(data).size == (32, 24)
+    assert _decode_webp(data).size == (32, 21)
 
 
 async def test_download_url_stops_at_max_bytes(monkeypatch):

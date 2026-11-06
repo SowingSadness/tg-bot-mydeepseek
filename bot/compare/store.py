@@ -28,13 +28,14 @@ CREATE TABLE IF NOT EXISTS comparisons (
   labels     TEXT    NOT NULL,
   zlib_bytes INTEGER NOT NULL,
   image_a    BLOB    NOT NULL,
-  image_b    BLOB    NOT NULL
+  image_b    BLOB    NOT NULL,
+  aspect     TEXT    NOT NULL DEFAULT '3:2'
 );
 CREATE INDEX IF NOT EXISTS comparisons_owner ON comparisons(owner_id, created_at DESC);
 """
 
 _COLUMNS = (
-    "id, owner_id, created_at, width, quality, labels, zlib_bytes, image_a, image_b"
+    "id, owner_id, created_at, width, quality, labels, zlib_bytes, image_a, image_b, aspect"
 )
 
 
@@ -51,6 +52,7 @@ class Cached:
     zlib_bytes: int
     image_a: bytes
     image_b: bytes
+    aspect: str = "3:2"
 
 
 class ComparisonStore:
@@ -76,7 +78,20 @@ class ComparisonStore:
         self._conn.execute("PRAGMA journal_mode=WAL").fetchone()
         self._conn.execute("PRAGMA synchronous=NORMAL")
         self._conn.executescript(_SCHEMA)
+        self._migrate_aspect(self._conn)
         self._conn.commit()
+
+    @staticmethod
+    def _migrate_aspect(conn: sqlite3.Connection) -> None:
+        """Добавляет колонку `aspect` в старую БД, не заполняя её.
+
+        Старые записи запечены в 4:3, поэтому при чтении NULL превращается
+        в `"4:3"` (прежний дефолт): только так `render_cached` пересоберёт
+        старый `#номер` в его настоящих пропорциях.
+        """
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(comparisons)")}
+        if "aspect" not in columns:
+            conn.execute("ALTER TABLE comparisons ADD COLUMN aspect TEXT")
 
     # ------------------------------------------------------------------ helpers
 
@@ -106,12 +121,13 @@ class ComparisonStore:
         zlib_bytes: int,
         image_a: bytes,
         image_b: bytes,
+        aspect: str,
     ) -> None:
         """Одна попытка INSERT; при конфликте откатывает транзакцию."""
         conn = self._connection()
         try:
             conn.execute(
-                f"INSERT INTO comparisons ({_COLUMNS}) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                f"INSERT INTO comparisons ({_COLUMNS}) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     cmp_id,
                     owner_id,
@@ -122,6 +138,7 @@ class ComparisonStore:
                     zlib_bytes,
                     image_a,
                     image_b,
+                    aspect,
                 ),
             )
             conn.commit()
@@ -181,6 +198,7 @@ class ComparisonStore:
         quality: int,
         labels: tuple[str, str],
         zlib_bytes: int,
+        aspect: str = "3:2",
         now: float | None = None,
     ) -> str:
         """Сохраняет сравнение и возвращает свободный номер (строкой).
@@ -208,6 +226,7 @@ class ComparisonStore:
                         zlib_bytes,
                         image_a,
                         image_b,
+                        str(aspect),
                     )
                 except sqlite3.IntegrityError:
                     attempts += 1
@@ -233,6 +252,8 @@ class ComparisonStore:
             zlib_bytes=row[6],
             image_a=row[7],
             image_b=row[8],
+            # NULL — запись из старой БД: она запечена в 4:3, это прежний дефолт.
+            aspect=str(row[9] or "4:3"),
         )
 
     async def purge(self, *, ttl_seconds: float, max_entries: int) -> int:

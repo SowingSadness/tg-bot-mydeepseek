@@ -1,9 +1,11 @@
-"""Хендлеры `/cmp`: две ссылки, две картинки или картинка в ответе.
+"""Хендлеры `/cmp`: ссылки, альбом из двух картинок или картинка в ответе.
 
 Роутер подключается **раньше** `private`: там есть catch-all
-`F.text.startswith("/")`, который иначе съел бы `/cmp`. Свой фильтр
-`AwaitingImages` нужен по той же причине: в `private` фото и документы уходят
-в DeepSeek, а здесь — только пока пользователь начал сравнение.
+`F.text.startswith("/")`, который иначе съел бы `/cmp`, а фото и документы
+уходят в DeepSeek. Здесь картинки перехватываются только в двух случаях:
+у сообщения есть подпись/текст `/cmp` или это продолжение нашего альбома
+(фильтр `AlbumContinuation`). Третье фото уже сравнённого альбома проходит
+фильтр, но сервис молча дропает его: в DeepSeek оно тоже не попадает.
 """
 
 from __future__ import annotations
@@ -31,12 +33,15 @@ _URL_RE = re.compile(r"https?://\S+")
 _URL_TAIL = ".,;"
 
 
-class AwaitingImages(Filter):
-    """Пропускает фото/документ, только если пользователь уже начал сравнение."""
+class AlbumContinuation(Filter):
+    """Пропускает фото/документ с нашим ключом: идёт сборка или шло сравнение."""
 
     async def __call__(self, message: Message) -> bool:
-        user = message.from_user
-        return bool(user and service.is_waiting(user.id))
+        return service.album_pending(
+            message.chat.id,
+            getattr(message, "media_group_id", None),
+            message.message_id,
+        )
 
 
 async def _download_url(url: str) -> bytes:
@@ -63,7 +68,7 @@ def _reply_image(message: Message):
 
 @router.message(Command("cmp"))
 async def on_cmp(message: Message) -> None:
-    """`/cmp` со ссылками, в ответе на фото или без аргументов (ждём две картинки)."""
+    """`/cmp` со ссылками, подписью к картинке, ответом на фото или без аргументов."""
     user = message.from_user
     if user is None:
         return
@@ -74,43 +79,49 @@ async def on_cmp(message: Message) -> None:
     urls = [url.rstrip(_URL_TAIL) for url in _URL_RE.findall(text)]
     urls = [url for url in urls if url]
     reply = _reply_image(message)
+    own_image = bool(getattr(message, "photo", None) or getattr(message, "document", None))
 
     try:
-        # Две ссылки — сразу сравниваем, даже если в ответе висит картинка.
+        # Две ссылки — сразу сравниваем, даже если в сообщении/ответе есть картинка.
         if len(urls) >= 2:
             await service.compare_urls(message, urls[:2])
             return
 
-        if reply is not None:
-            first = await service.download_message_image(reply)
+        if own_image:
             if urls:
-                # Картинка в ответе + одна ссылка: сравниваем сразу.
-                await service.compare_images(message, first, await _download_url(urls[0]))
+                # Подпись /cmp к картинке + одна ссылка: сравниваем сразу.
+                first = await service.download_message_image(message)
+                await service.compare_images(
+                    message, first, await _download_url(urls[0])
+                )
             else:
-                await service.start_with(message, first)
+                # Картинка с подписью /cmp — старт альбома, ждём остальные.
+                await service.arm_album(message)
             return
 
-        if urls:
-            await service.start_with(message, await _download_url(urls[0]))
+        if reply is not None and urls:
+            # Картинка в ответе + одна ссылка: сравниваем сразу.
+            first = await service.download_message_image(reply)
+            await service.compare_images(message, first, await _download_url(urls[0]))
             return
     except images.ImageError as exc:
         # Текст уже человеческий («не картинка», «больше 20 МБ», «не скачалось»).
         await message.answer(str(exc))
         return
 
-    service.start_empty(user.id)
-    await message.answer(service.START_INSTRUCTION)
+    # Ни двух ссылок, ни картинки с подписью: подсказываем формат, состояние не держим.
+    await message.answer(service.NEED_TWO_TEXT)
 
 
-@router.message(F.photo | F.document, AwaitingImages())
-async def on_image(message: Message) -> None:
-    """Вторая (или первая после пустого `/cmp`) картинка в текущем ожидании."""
+@router.message(F.photo | F.document, AlbumContinuation())
+async def on_album_image(message: Message) -> None:
+    """Следующая картинка уже начатого альбома (обычно без подписи)."""
     user = message.from_user
     if user is None:
         return
     if not is_allowed(user.id):
         return await deny(message)
-    await service.add_image(message)
+    await service.add_album_image(message)
 
 
-__all__ = ["AwaitingImages", "on_cmp", "on_image", "router"]
+__all__ = ["AlbumContinuation", "on_album_image", "on_cmp", "router"]

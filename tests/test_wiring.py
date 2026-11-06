@@ -155,7 +155,6 @@ async def test_compare_images_uses_real_store(tmp_path) -> None:
     fake_api = FakeAPI()
     service_module.configure_store(store)
     api_module.configure(fake_api)  # type: ignore[arg-type]
-    service_module._pending.clear()
     try:
         message = FakeMessage()
         await service_module.compare_images(
@@ -176,8 +175,9 @@ async def test_compare_images_uses_real_store(tmp_path) -> None:
         assert cached is not None
         assert cached.owner_id == message.from_user.id
         assert cached.image_a and cached.image_b
+        # Пропорции бабла сохраняются в кеше: inline пересоберёт старый номер 1:1.
+        assert cached.aspect == settings.cmp_aspect == "3:2"
     finally:
-        service_module._pending.clear()
         service_module.configure_store(None)  # type: ignore[arg-type]
         api_module.configure(None)  # type: ignore[arg-type]
         await store.close()

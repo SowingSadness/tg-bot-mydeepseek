@@ -37,6 +37,8 @@ def _found_result(cached: Cached) -> dict:
         labels=settings.cmp_labels_pair,
         title=settings.cmp_title,
         hint=settings.cmp_hint,
+        # Старые номера пересобираются в своих пропорциях, а не в текущих по умолчанию.
+        aspect=cached.aspect,
     )
     first, second = settings.cmp_labels_pair
     return {

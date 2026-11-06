@@ -38,7 +38,7 @@ def commands() -> list[BotCommand]:
     return [
         BotCommand(command="start", description="О боте"),
         BotCommand(command="help", description="Помощь"),
-        BotCommand(command="cmp", description="Сравнить две картинки"),
+        BotCommand(command="cmp", description="Сравнить две картинки (альбом + /cmp)"),
         BotCommand(command="think", description="Режим рассуждений вкл/выкл"),
         BotCommand(command="reset", description="Сбросить настройки"),
     ]

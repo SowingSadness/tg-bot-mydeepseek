@@ -1,8 +1,19 @@
-"""Сценарии `/cmp`: две ссылки, две присланные картинки или картинка в ответе.
+"""Сценарии `/cmp`: две ссылки, альбом из двух картинок или картинка в ответе.
 
 Модуль связывает четыре части: скачивание картинок (`images`), сборку бабла
 (`build`), дисковый кеш (`store`) и отправку виджета (`api`). Всё, что видит
 пользователь, — короткие русские сообщения; стектрейсы остаются в логе.
+
+Картинки приходят **вместе с командой**: Telegram шлёт каждое фото альбома
+отдельным апдейтом с общим `media_group_id`, а подпись обычно есть только у
+первого. Поэтому подпись `/cmp` заводит буфер `(chat_id, media_group_id или
+message_id)` и дебаунс: следующие картинки того же альбома добавляются в буфер,
+а как только их стало две — сравнение запускается сразу, не дожидаясь таймера.
+
+Ключ буфера занимается **синхронно**, ещё до `await` за скачиванием — aiogram
+обрабатывает апдейты альбома конкурентно (`handle_as_tasks`), и второе фото не
+должно уйти в DeepSeek, пока докачивается первое. После сравнения ключ ещё
+недолго живёт в `_closed`: третье фото того же альбома молча дропается.
 
 Порядок в `compare_images` принципиален: **сначала** номер и картинки попадают
 в кеш, и только потом уходит `sendWidget`. Иначе inline по `#номер` мог бы
@@ -11,9 +22,9 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
-import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from aiogram.types import BufferedInputFile, InputMediaDocument
 
@@ -25,30 +36,42 @@ from .store import ComparisonStore
 
 log = logging.getLogger(__name__)
 
-#: Что показываем, если сравнивать пока нечего.
-START_INSTRUCTION = (
-    "Пришлите две картинки: двумя сообщениями, альбомом или ссылками: "
-    "/cmp https://a.jpg https://b.jpg"
+#: Что показываем, если двух картинок так и не набралось.
+NEED_TWO_TEXT = (
+    "Нужны две картинки: прикрепите оба фото одним альбомом и подпишите /cmp, "
+    "или пришлите ссылки: /cmp https://a.jpg https://b.jpg"
 )
-#: Первая картинка принята.
-FIRST_IMAGE_TEXT = "1/2 — пришлите вторую картинку."
-#: Ожидание второй картинки протухло.
-EXPIRED_TEXT = "Ожидание второй картинки истекло — начните заново: /cmp"
 #: Не удалось уложить картинки в лимиты виджета.
 TOO_LARGE_TEXT = (
     "Картинки слишком пёстрые, чтобы уместиться в бабл — пришлите картинки поменьше."
 )
 
+#: Ключ буфера альбома: `(chat_id, media_group_id)` или `(chat_id, message_id)`.
+AlbumKey = tuple[int, str | int]
+
 
 @dataclass
-class Pending:
-    """Ожидание второй картинки: первая (если есть) и дедлайн по `monotonic`."""
+class Album:
+    """Собираемый альбом: картинки, последнее сообщение, дебаунс и счётчик скачиваний.
 
-    first: bytes | None
-    expires: float
+    ``task`` — и есть дебаунс (`expires`): таймер, продлеваемый каждым новым фото.
+    ``pending`` — сколько картинок сейчас скачивается; пока счётчик больше нуля,
+    дебаунс не сравнивает альбом, иначе медленная первая картинка потеряется.
+    ``first_pending`` — в альбоме зарезервирован слот 0 под картинку с подписью
+    `/cmp`: она может докачаться позже второго фото, но остаётся первой.
+    """
+
+    chat_id: int
+    message: object
+    images: list[bytes] = field(default_factory=list)
+    task: asyncio.Task | None = None
+    pending: int = 0
+    first_pending: bool = False
 
 
-_pending: dict[int, Pending] = {}
+_albums: dict[AlbumKey, Album] = {}
+#: Только что сравнённые ключи: третье фото альбома молча дропается, а не уходит в DeepSeek.
+_closed: dict[AlbumKey, asyncio.Task] = {}
 
 _store: ComparisonStore | None = None
 
@@ -69,36 +92,122 @@ def get_store() -> ComparisonStore:
     return _store
 
 
-def _now() -> float:
-    """Монотонные часы ожидания (тесты подменяют функцию, а не модуль `time`)."""
-    return time.monotonic()
+def _album_wait() -> float:
+    """Сколько ждать остальные картинки альбома (тесты подменяют функцию)."""
+    return float(settings.cmp_album_wait)
 
 
-def _state(user_id: int) -> tuple[Pending | None, bool]:
-    """Текущее ожидание и признак «было, но истекло» (истёкшее сразу удаляется)."""
-    state = _pending.get(user_id)
-    if state is None:
-        return None, False
-    if state.expires <= _now():
-        _pending.pop(user_id, None)
-        return None, True
-    return state, False
+def _album_key(message) -> AlbumKey:
+    """Альбом опознаётся по `media_group_id`, одиночное сообщение — по `message_id`."""
+    group = getattr(message, "media_group_id", None)
+    return (message.chat.id, group or message.message_id)
 
 
-def is_waiting(user_id: int) -> bool:
-    """Ждём ли от пользователя вторую картинку (с учётом TTL)."""
-    state, _ = _state(user_id)
-    return state is not None
+def album_pending(
+    chat_id: int,
+    media_group_id: str | None = None,
+    message_id: int | None = None,
+) -> bool:
+    """Наш ли ключ: идёт сборка альбома или совсем недавно прошло сравнение."""
+    key = (chat_id, media_group_id or message_id)
+    return key in _albums or key in _closed
 
 
-def start_empty(user_id: int) -> None:
-    """Начинает ожидание с нуля: первая картинка ещё не пришла."""
-    _pending[user_id] = Pending(None, _now() + settings.cmp_pending_ttl)
+def _current_task() -> asyncio.Task | None:
+    """Текущая задача или None вне работающего цикла (синхронные тесты/вызовы)."""
+    try:
+        return asyncio.current_task()
+    except RuntimeError:
+        return None
 
 
-def clear(user_id: int) -> None:
-    """Сбрасывает ожидание пользователя."""
-    _pending.pop(user_id, None)
+def _schedule(key: AlbumKey, album: Album) -> None:
+    """Перезапускает дебаунс: каждое новое фото продлевает ожидание."""
+    if album.task is not None:
+        album.task.cancel()
+    album.task = asyncio.create_task(_expire(key))
+
+
+async def _expire(key: AlbumKey) -> None:
+    """Дебаунс истёк: отдаём буфер на сборку или просим дослать вторую картинку."""
+    try:
+        await asyncio.sleep(_album_wait())
+    except asyncio.CancelledError:
+        return
+    _flush(key)
+
+
+def _close_wait() -> float:
+    """Сколько держать ключ закрытым после сравнения (тесты подменяют функцию)."""
+    return max(_album_wait() * 3.0, 5.0)
+
+
+def _close(key: AlbumKey) -> None:
+    """Помечает ключ закрытым на короткое время: лишние фото альбома уже не нужны."""
+    task = _closed.pop(key, None)
+    if task is not None:
+        task.cancel()
+    _closed[key] = asyncio.create_task(_expire_closed(key))
+
+
+async def _expire_closed(key: AlbumKey) -> None:
+    """Снимает закрытый ключ, когда альбом заведомо дослан (или уже не дослан)."""
+    try:
+        await asyncio.sleep(_close_wait())
+    except asyncio.CancelledError:
+        return
+    if _closed.get(key) is _current_task():
+        _closed.pop(key, None)
+
+
+def _drop_album(key: AlbumKey, album: Album) -> None:
+    """Снимает резерв ключа, если картинка так и не скачалась."""
+    if _albums.get(key) is album:
+        _albums.pop(key, None)
+    task, album.task = album.task, None
+    if task is not None and task is not _current_task():
+        task.cancel()
+
+
+def _flush(key: AlbumKey) -> None:
+    """Забирает буфер: две картинки — сравнение, одна — инструкция. Буфер пуст."""
+    album = _albums.get(key)
+    if album is None:
+        return
+    if album.pending > 0:
+        # Картинка ещё скачивается: ключ остаётся занятым, дебаунс ждёт дальше.
+        if album.task is _current_task():
+            album.task = None
+        _schedule(key, album)
+        return
+
+    _albums.pop(key, None)
+    task, album.task = album.task, None
+    if task is not None and task is not _current_task():
+        task.cancel()
+
+    if len(album.images) >= 2:
+        if len(album.images) > 2:
+            log.info(
+                "Альбом %s: пришло %d картинок — сравниваю первые две",
+                key,
+                len(album.images),
+            )
+        _close(key)
+        asyncio.create_task(
+            compare_images(album.message, album.images[0], album.images[1])
+        )
+        return
+
+    asyncio.create_task(album.message.answer(NEED_TWO_TEXT))
+
+
+def _after_append(key: AlbumKey, album: Album) -> None:
+    """Две картинки — сразу сравниваем; одна — ждём остальные до дебаунса."""
+    if len(album.images) >= 2:
+        _flush(key)
+    else:
+        _schedule(key, album)
 
 
 def _image_ref(message) -> tuple[str | None, int | None]:
@@ -146,44 +255,65 @@ async def download_message_image(message) -> bytes:
     return raw
 
 
-async def start_with(message, first: bytes | None) -> None:
-    """Первая картинка уже есть (или её нет) — ждём вторую."""
-    user_id = message.from_user.id
-    if first is None:
-        start_empty(user_id)
-        await message.answer(START_INSTRUCTION)
+async def arm_album(message) -> None:
+    """Старт альбома по подписи `/cmp` у картинки: первая картинка уже есть.
+
+    Ключ занимается **синхронно**, до первого `await`: aiogram обрабатывает
+    апдейты альбома конкурентно, и второе фото может прийти раньше, чем
+    докачается первое. Иначе продолжение не узнаёт альбом и уйдёт в DeepSeek.
+    """
+    key = _album_key(message)
+    album = _albums.get(key)
+    if album is None:
+        album = Album(chat_id=message.chat.id, message=message)
+        _albums[key] = album
+    album.message = message
+    album.pending += 1
+    album.first_pending = True
+    _schedule(key, album)
+
+    try:
+        raw = await download_message_image(message)
+    except images.ImageError as exc:
+        album.pending -= 1
+        album.first_pending = False
+        if not album.images and album.pending == 0:
+            _drop_album(key, album)
+        await message.answer(str(exc))
+        return
+    album.pending -= 1
+
+    if album.first_pending:
+        # Подписанная картинка остаётся первой, даже если докачалась позже.
+        album.images.insert(0, raw)
+        album.first_pending = False
+    else:
+        album.images.append(raw)
+    _after_append(key, album)
+
+
+async def add_album_image(message) -> None:
+    """Продолжение начатого альбома: добавляет картинку и продлевает дебаунс."""
+    key = _album_key(message)
+    album = _albums.get(key)
+    if album is None:
+        if key in _closed:
+            # Третье и следующие фото альбома: сравнение уже прошло — молча дропаем.
+            log.debug("Альбом %s уже сравнён — фото %s игнорирую", key, message.message_id)
         return
 
-    _pending[user_id] = Pending(first, _now() + settings.cmp_pending_ttl)
-    await message.answer(FIRST_IMAGE_TEXT)
-
-
-async def add_image(message) -> None:
-    """Принимает очередную картинку пользователя: первая → 1/2, вторая → сравнение."""
-    user_id = message.from_user.id
-    state, expired = _state(user_id)
-    if state is None:
-        # Не ждём: чужой сценарий (например, фото для DeepSeek). Но если ожидание
-        # только что истекло — подсказываем начать заново, а не молчим.
-        if expired:
-            await message.answer(EXPIRED_TEXT)
-        return
-
+    album.pending += 1
     try:
         raw = await download_message_image(message)
     except images.ImageError as exc:
         await message.answer(str(exc))
         return
+    finally:
+        album.pending -= 1
 
-    if state.first is None:
-        state.first = raw
-        state.expires = _now() + settings.cmp_pending_ttl
-        await message.answer(FIRST_IMAGE_TEXT)
-        return
-
-    first = state.first
-    clear(user_id)
-    await compare_images(message, first, raw)
+    album.message = message
+    album.images.append(raw)
+    _after_append(key, album)
 
 
 async def compare_images(message, a: bytes, b: bytes) -> None:
@@ -204,6 +334,7 @@ async def compare_images(message, a: bytes, b: bytes) -> None:
             labels=labels,
             title=settings.cmp_title,
             hint=settings.cmp_hint,
+            aspect=settings.cmp_aspect_pair,
         )
     except images.ImageError as exc:
         await message.answer(str(exc))
@@ -222,6 +353,7 @@ async def compare_images(message, a: bytes, b: bytes) -> None:
         quality=built.quality,
         labels=labels,
         zlib_bytes=built.zlib_bytes,
+        aspect=built.aspect,
     )
     caption = settings.cmp_caption.format(id=cmp_id, a=labels[0], b=labels[1])
     html = build.render_cached(
@@ -230,6 +362,7 @@ async def compare_images(message, a: bytes, b: bytes) -> None:
         labels=labels,
         title=settings.cmp_title,
         hint=settings.cmp_hint,
+        aspect=built.aspect,
     )
 
     api = api_module.get_api()
@@ -303,19 +436,15 @@ async def compare_urls(message, urls: list[str]) -> None:
 
 
 __all__ = [
-    "EXPIRED_TEXT",
-    "FIRST_IMAGE_TEXT",
-    "Pending",
-    "START_INSTRUCTION",
+    "Album",
+    "NEED_TWO_TEXT",
     "TOO_LARGE_TEXT",
-    "add_image",
-    "clear",
+    "add_album_image",
+    "album_pending",
+    "arm_album",
     "compare_images",
     "compare_urls",
     "configure_store",
     "download_message_image",
     "get_store",
-    "is_waiting",
-    "start_empty",
-    "start_with",
 ]

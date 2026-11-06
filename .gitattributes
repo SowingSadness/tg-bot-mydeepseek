@@ -1,0 +1,4 @@
+# .cmd/.bat должны лежать в репозитории и выгружаться с CRLF: с LF-only
+# cmd.exe ломает разбор многострочных блоков (if/goto), см. cmp-demo.cmd.
+*.cmd text eol=crlf
+*.bat text eol=crlf

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import re
+from fractions import Fraction
 from pathlib import Path
 
 from pydantic import field_validator
@@ -48,18 +50,22 @@ class Settings(BaseSettings):
     # true = методы зовутся как /bot<token>/test/<method> (тестовый контур Telegram).
     widget_api_test_env: bool = False
 
-    # Сравнение картинок (/cmp): дисковый кеш, кроп 4:3 и лимиты виджета.
+    # Сравнение картинок (/cmp): дисковый кеш, пропорции бабла и лимиты виджета.
     cmp_cache_dir: Path = Path("var/cmp")
     cmp_cache_ttl_days: int = 30
     cmp_cache_max_entries: int = 2000
     cmp_target_width: int = 430
     cmp_min_width: int = 160
     cmp_start_quality: int = 34
-    cmp_min_quality: int = 16
+    # Нижняя граница: на тяжёлых фото 430 px влезает только при q12.
+    cmp_min_quality: int = 12
     # Запас под лимит zlib(level 9) = 4096 байт.
     cmp_zlib_margin: int = 64
     cmp_max_bytes: int = 8388608
-    cmp_pending_ttl: int = 300
+    # Сколько ждать остальные картинки альбома после подписи /cmp (секунды).
+    cmp_album_wait: float = 0.9
+    # Пропорции бабла: A:B, например 3:2 (по умолчанию), 4:3, 16:9, 2.66:1.
+    cmp_aspect: str = "3:2"
     cmp_id_digits: int = 6
     cmp_share_by_id: bool = False
     cmp_show_hint: bool = True
@@ -77,6 +83,13 @@ class Settings(BaseSettings):
             raise ValueError("CMP_LABELS должен содержать ровно две подписи через '|'")
         return value
 
+    @field_validator("cmp_aspect")
+    @classmethod
+    def _check_aspect(cls, value: str) -> str:
+        """Пропорции задаются как `A:B`, оба числа положительные."""
+        _aspect_pair(value)  # валидация без побочного эффекта
+        return value.strip()
+
     @field_validator("bot_username")
     @classmethod
     def _normalize_username(cls, value: str) -> str:
@@ -93,6 +106,11 @@ class Settings(BaseSettings):
         return first.strip(), second.strip()
 
     @property
+    def cmp_aspect_pair(self) -> tuple[int, int]:
+        """Пропорции бабла целыми числами: `3:2` → `(3, 2)`, `2.66:1` → `(133, 50)`."""
+        return _aspect_pair(self.cmp_aspect)
+
+    @property
     def allowed_ids(self) -> set[int]:
         ids: set[int] = set()
         for chunk in self.allowed_user_ids.replace(";", ",").split(","):
@@ -100,6 +118,21 @@ class Settings(BaseSettings):
             if chunk.lstrip("-").isdigit():
                 ids.add(int(chunk))
         return ids
+
+
+_ASPECT_RE = re.compile(r"^\s*(\d+(?:\.\d+)?)\s*:\s*(\d+(?:\.\d+)?)\s*$")
+
+
+def _aspect_pair(value: str) -> tuple[int, int]:
+    """Разбирает `A:B` в целую пару; дроби вроде `2.66:1` сводятся к `133:50`."""
+    match = _ASPECT_RE.fullmatch(str(value))
+    if match is None:
+        raise ValueError("CMP_ASPECT должен быть в формате A:B (например 3:2)")
+    left, right = (Fraction(part) for part in match.groups())
+    if left <= 0 or right <= 0:
+        raise ValueError("CMP_ASPECT: оба числа должны быть больше нуля")
+    ratio = (left / right).limit_denominator(1000)
+    return ratio.numerator, ratio.denominator
 
 
 settings = Settings()
