@@ -5,14 +5,19 @@ Inline-режим обязан ответить примерно за 10 сек�
 ``build.render_cached`` (пересборка HTML из уже сжатых WebP за миллисекунды).
 
 Выдача на найденный номер — до трёх результатов в таком порядке:
-фото-композит (если есть ``preview_file_id``), article с url-кнопкой
-«Открыть сравнение» (если задан ``CMP_WEBAPP_SHORT_NAME``) и текстовый
-результат (всегда, чтобы выдача не была пустой).
+фото-композит «Вставить превью» с url-кнопкой «Открыть сравнение»
+(если есть ``preview_file_id``), article «Открыть сравнение» с той же
+кнопкой (если задан ``BOT_USERNAME`` — а он обязателен) и текстовый
+фолбэк — **только** когда нет ни фото, ни кнопки.
+
+Кнопка не зависит от ``CMP_WEBAPP_SHORT_NAME``: пустое значение — валидная
+конфигурация для Main Mini App, ссылка получается ``https://t.me/<bot>?startapp=…``;
+заданное — ``https://t.me/<bot>/<short>?startapp=…``.
 
 Шторка (widget-контент) в inline отдаётся только при ``CMP_INLINE_WIDGET=true``:
 бета Bot API отклоняет widget в inline-выдаче (``INPUT_MEDIA_WIDGET_NOT_ALLOWED``),
 поэтому по умолчанию её нет, а при включённом флаге отказ сервера приводит к
-повтору без шторки (фото, кнопка и текст остаются).
+повтору без шторки (фото и кнопка остаются).
 
 Голый ``#`` и номера короче шести цифр — подсказка; всё, что не похоже на
 ``#<6-8 цифр>``, отдаём обычному DeepSeek-пути (``False``).
@@ -49,30 +54,51 @@ def _start_token(cmp_id: str) -> str:
     return webauth.sign(cmp_id)
 
 
+def _webapp_button(cached: Cached) -> dict | None:
+    """url-кнопка «Открыть сравнение» на мини-апп или ``None`` без ``BOT_USERNAME``.
+
+    Форма ссылки одна на всю выдачу: с short name — отдельное приложение
+    (``t.me/<bot>/<short>?startapp=…``), без него — Main Mini App
+    (``t.me/<bot>?startapp=…``, ``messages.requestMainWebView``).
+    """
+    bot = settings.bot_username
+    if not bot:
+        return None
+    token = _start_token(cached.id)
+    short = settings.cmp_webapp_short_name
+    if short:
+        link = f"https://t.me/{bot}/{short}?startapp={token}"
+    else:
+        link = f"https://t.me/{bot}?startapp={token}"
+    return {"inline_keyboard": [[{"text": "Открыть сравнение", "url": link}]]}
+
+
 def _photo_result(cached: Cached) -> dict:
-    """``InlineQueryResultCachedPhoto``: композит «A|B» прямо в выдаче.
+    """``InlineQueryResultCachedPhoto``: композит «A|B» с кнопкой мини-аппа.
 
     Работает только для сравнений, у которых уже есть ``preview_file_id``
-    (его сохраняет `/cmp` после загрузки композита в личку).
+    (его сохраняет `/cmp` после загрузки композита в личку). Заголовок
+    «Вставить превью» говорит, что произойдёт при выборе пункта.
     """
     first, second = settings.cmp_labels_pair
-    return {
+    caption = f"Сравнение #{cached.id} · {first} / {second}"
+    result = {
         "type": "photo",
         "id": f"{cached.id}-photo",
         "photo_file_id": cached.preview_file_id,
-        "title": f"Сравнение #{cached.id}",
-        "description": f"{first} / {second}",
-        "caption": f"Сравнение #{cached.id} · {first} / {second}",
+        "title": "Вставить превью",
+        "description": caption,
+        "caption": caption,
     }
+    button = _webapp_button(cached)
+    if button is not None:
+        result["reply_markup"] = button
+    return result
 
 
 def _open_result(cached: Cached) -> dict:
     """Article с url-кнопкой на мини-апп (``web_app`` в inline запрещён)."""
     first, second = settings.cmp_labels_pair
-    link = (
-        f"https://t.me/{settings.bot_username}/{settings.cmp_webapp_short_name}"
-        f"?startapp={_start_token(cached.id)}"
-    )
     return {
         "type": "article",
         "id": f"{cached.id}-open",
@@ -81,23 +107,28 @@ def _open_result(cached: Cached) -> dict:
         "input_message_content": {
             "message_text": f"Сравнение #{cached.id} · {first} / {second}",
         },
-        "reply_markup": {
-            "inline_keyboard": [[{"text": "Открыть сравнение", "url": link}]],
-        },
+        "reply_markup": _webapp_button(cached),
     }
 
 
 def _text_result(cached: Cached) -> dict:
-    """Текст на случай, когда фото и кнопки нет или их не вставили."""
+    """Текст на случай, когда нет ни превью, ни возможности открыть мини-апп."""
     first, second = settings.cmp_labels_pair
-    if settings.cmp_webapp_short_name and settings.bot_username:
-        tail = "Полноразмерное сравнение — кнопкой «Открыть сравнение»."
-    else:
-        tail = "Откройте бота в личке и пришлите две картинки командой /cmp."
+    reasons: list[str] = []
+    if not cached.preview_file_id:
+        reasons.append("превью для этого номера ещё не готово")
+    if not settings.bot_username:
+        reasons.append("мини-приложение не настроено (пустой BOT_USERNAME)")
+    if not reasons:  # защита: без превью и кнопки выдача была бы пустой
+        reasons.append("фото и кнопка недоступны")
+    tail = (
+        "Причина: " + "; ".join(reasons)
+        + ". Откройте бота в личке и пришлите две картинки командой /cmp."
+    )
     return {
         "type": "article",
         "id": f"{cached.id}-text",
-        "title": f"Сравнение #{cached.id}",
+        "title": f"Сравнение #{cached.id} · только текст",
         "description": f"{first} / {second}",
         "input_message_content": {
             "message_text": f"Сравнение #{cached.id} · {first} / {second}\n{tail}",
@@ -108,16 +139,18 @@ def _text_result(cached: Cached) -> dict:
 def _found_results(cached: Cached) -> list[dict]:
     """Результаты для найденного сравнения: фото → кнопка → текст (→ шторка).
 
-    Текстовый результат есть всегда: без него (если нет ни ``preview_file_id``,
-    ни мини-аппа) выдача была бы пустой. Шторка идёт последней и толькo при
-    ``CMP_INLINE_WIDGET=true``: бета Bot API отклоняет widget в inline.
+    Текстовый фолбэк добавляется **только** если показать больше нечего: нет
+    ни ``preview_file_id``, ни url-кнопки (``BOT_USERNAME`` пуст). Шторка идёт
+    последней и только при ``CMP_INLINE_WIDGET=true``: бета Bot API отклоняет
+    widget в inline.
     """
     results: list[dict] = []
     if cached.preview_file_id:
         results.append(_photo_result(cached))
-    if settings.cmp_webapp_short_name and settings.bot_username:
+    if _webapp_button(cached) is not None:
         results.append(_open_result(cached))
-    results.append(_text_result(cached))
+    if not results:
+        results.append(_text_result(cached))
     if settings.cmp_inline_widget:
         results.append(_found_result(cached))
     return results
@@ -226,7 +259,7 @@ async def try_answer(query) -> bool:
             await _answer(api, query, results)
         except api_module.WidgetAPIError:
             # Сервер не принял widget-контент (INPUT_MEDIA_WIDGET_NOT_ALLOWED):
-            # повторяем без шторки — фото, кнопка и текстовый результат остаются.
+            # повторяем без шторки — фото и кнопка остаются.
             fallback = [result for result in results if result["id"] != cached.id]
             if len(fallback) == len(results):
                 raise

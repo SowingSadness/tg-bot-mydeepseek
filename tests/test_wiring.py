@@ -181,6 +181,36 @@ async def test_setup_compare_creates_cache_and_configures(tmp_path, monkeypatch)
     await main_module.teardown_compare()
 
 
+async def test_setup_compare_logs_main_mini_app_link(
+    tmp_path, monkeypatch, caplog
+) -> None:
+    """Пустой `CMP_WEBAPP_SHORT_NAME` — Main Mini App, в логе форма без short name."""
+    monkeypatch.setattr(settings, "cmp_cache_dir", tmp_path / "cmp")
+    monkeypatch.setattr(settings, "cmp_webapp_short_name", "")
+
+    with caplog.at_level(logging.INFO, logger=main_module.log.name):
+        await main_module.setup_compare()
+    try:
+        assert f"https://t.me/{settings.bot_username}?startapp=…" in caplog.text
+        assert "Main Mini App" in caplog.text
+    finally:
+        await main_module.teardown_compare()
+
+
+async def test_setup_compare_logs_short_name_link(tmp_path, monkeypatch, caplog) -> None:
+    """Заданный `CMP_WEBAPP_SHORT_NAME` — ссылка с `/<short>` и без пометки Main Mini App."""
+    monkeypatch.setattr(settings, "cmp_cache_dir", tmp_path / "cmp")
+    monkeypatch.setattr(settings, "cmp_webapp_short_name", "cmpapp")
+
+    with caplog.at_level(logging.INFO, logger=main_module.log.name):
+        await main_module.setup_compare()
+    try:
+        assert f"https://t.me/{settings.bot_username}/cmpapp?startapp=…" in caplog.text
+        assert "Main Mini App" not in caplog.text
+    finally:
+        await main_module.teardown_compare()
+
+
 async def test_setup_compare_purge_removes_originals(tmp_path, monkeypatch) -> None:
     """`purge` при старте собирает мусор вместе с файлами оригиналов."""
     cache = tmp_path / "cmp"

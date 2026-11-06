@@ -122,6 +122,7 @@ def _clean_singletons(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr(settings, "cmp_share_by_id", False)
     monkeypatch.setattr(settings, "cmp_webapp_short_name", "")
     monkeypatch.setattr(settings, "cmp_inline_widget", False)
+    monkeypatch.setattr(settings, "bot_username", "test_bot")
     yield
 
 
@@ -155,8 +156,37 @@ def test_id_re_rejects_everything_else(text: str):
 # ------------------------------------------------------- multi-result payload
 
 
-async def test_found_comparison_returns_photo_open_and_text(monkeypatch: pytest.MonkeyPatch):
-    """Порядок выдачи: фото-превью → кнопка мини-аппа → текст (без шторки)."""
+def _button_url(result: dict) -> str:
+    """url единственной кнопки в ``reply_markup`` результата."""
+    return result["reply_markup"]["inline_keyboard"][0][0]["url"]
+
+
+def _assert_short_app_token(url: str, short: str = SHORT_NAME) -> None:
+    """``https://t.me/<bot>/<short>?startapp=<id>_<sig>`` — отдельное мини-приложение."""
+    prefix = f"https://t.me/{settings.bot_username}/{short}?startapp="
+    assert url.startswith(prefix)
+    token = url[len(prefix):]
+    assert START_TOKEN_RE.fullmatch(token) is not None
+    assert token.startswith(f"{CMP_ID}_")
+    assert len(token) <= 64
+    # Без экранированной/литеральной точки: Telegram ждёт base64url.
+    assert "%2E" not in url and "." not in token
+
+
+def _assert_main_app_token(url: str) -> None:
+    """``https://t.me/<bot>?startapp=<id>_<sig>`` — Main Mini App (без short name)."""
+    prefix = f"https://t.me/{settings.bot_username}?startapp="
+    assert url.startswith(prefix)
+    token = url[len(prefix):]
+    assert START_TOKEN_RE.fullmatch(token) is not None
+    assert token.startswith(f"{CMP_ID}_")
+    assert "/" not in url[len("https://t.me/"):]
+
+
+async def test_found_comparison_returns_photo_and_open_with_short_name(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """Порядок: фото «Вставить превью» с кнопкой → article «Открыть сравнение»."""
     monkeypatch.setattr(settings, "cmp_webapp_short_name", SHORT_NAME)
     store = FakeStore(cached(preview_file_id=PREVIEW_FILE_ID))
     api = FakeAPI()
@@ -169,44 +199,50 @@ async def test_found_comparison_returns_photo_open_and_text(monkeypatch: pytest.
     assert call["is_personal"] is True
 
     results = _results(api)
-    assert [result["type"] for result in results] == ["photo", "article", "article"]
+    assert [result["type"] for result in results] == ["photo", "article"]
     assert [result["id"] for result in results] == [
         f"{CMP_ID}-photo",
         f"{CMP_ID}-open",
-        f"{CMP_ID}-text",
     ]
 
     first, second = settings.cmp_labels_pair
+    label_line = f"Сравнение #{CMP_ID} · {first} / {second}"
 
-    photo = results[0]
+    photo, open_result = results
+    assert photo["title"] == "Вставить превью"
+    assert photo["description"] == label_line
+    assert photo["caption"] == label_line
     assert photo["photo_file_id"] == PREVIEW_FILE_ID
-    assert photo["title"] == f"Сравнение #{CMP_ID}"
-    assert photo["description"] == f"{first} / {second}"
-    assert photo["caption"] == f"Сравнение #{CMP_ID} · {first} / {second}"
+    _assert_short_app_token(_button_url(photo))
 
-    open_result = results[1]
     assert open_result["title"] == "Открыть сравнение"
     assert open_result["description"] == "Полноразмерное сравнение в мини-приложении"
-    assert open_result["input_message_content"] == {
-        "message_text": f"Сравнение #{CMP_ID} · {first} / {second}",
-    }
+    assert open_result["input_message_content"] == {"message_text": label_line}
+    assert open_result["reply_markup"] == photo["reply_markup"]
     button = open_result["reply_markup"]["inline_keyboard"][0][0]
     assert button["text"] == "Открыть сравнение"
-    prefix = f"https://t.me/{settings.bot_username}/{SHORT_NAME}?startapp="
-    assert button["url"].startswith(prefix)
-    token = button["url"][len(prefix):]
-    assert START_TOKEN_RE.fullmatch(token) is not None
-    assert token.startswith(f"{CMP_ID}_")
-    assert len(token) <= 64
-    # Без экранированной/литеральной точки: Telegram ждёт base64url.
-    assert "%2E" not in button["url"] and "." not in token
+    _assert_short_app_token(button["url"])
 
-    # Текстовый результат есть всегда; шторки (widget-контента) по умолчанию нет.
-    text_result = results[2]
-    assert "html" not in text_result["input_message_content"]
-    assert text_result["input_message_content"]["message_text"].startswith(
-        f"Сравнение #{CMP_ID} · {first} / {second}"
+    # Текстового результата в этой выдаче нет: выбрать его вместо фото нельзя.
+    assert not any(
+        result.get("title") == f"Сравнение #{CMP_ID} · только текст" for result in results
     )
+    assert all(result["id"] != f"{CMP_ID}-text" for result in results)
+
+
+async def test_main_app_link_when_short_name_is_empty():
+    """Пустой short name — Main Mini App: ``t.me/<bot>?startapp=<token>``."""
+    store = FakeStore(cached(preview_file_id=PREVIEW_FILE_ID))
+    api = FakeAPI()
+    configure(store, api)
+
+    assert await compare_inline.try_answer(make_query(f"#{CMP_ID}")) is True
+
+    results = _results(api)
+    assert [result["id"] for result in results] == [f"{CMP_ID}-photo", f"{CMP_ID}-open"]
+    photo, open_result = results
+    _assert_main_app_token(_button_url(photo))
+    assert open_result["reply_markup"] == photo["reply_markup"]
 
 
 @pytest.mark.parametrize("preview_file_id", [None, ""])
@@ -222,23 +258,15 @@ async def test_photo_result_absent_without_preview_file_id(
     assert await compare_inline.try_answer(make_query(f"#{CMP_ID}")) is True
 
     results = _results(api)
-    assert [result["id"] for result in results] == [f"{CMP_ID}-open", f"{CMP_ID}-text"]
+    # Старая запись без превью: остаётся article с кнопкой, текстового нет.
+    assert [result["id"] for result in results] == [f"{CMP_ID}-open"]
     assert all("photo_file_id" not in result for result in results)
+    _assert_short_app_token(_button_url(results[0]))
 
 
-async def test_open_result_absent_without_short_name():
-    store = FakeStore(cached(preview_file_id=PREVIEW_FILE_ID))
-    api = FakeAPI()
-    configure(store, api)
-
-    assert await compare_inline.try_answer(make_query(f"#{CMP_ID}")) is True
-
-    results = _results(api)
-    assert [result["id"] for result in results] == [f"{CMP_ID}-photo", f"{CMP_ID}-text"]
-    assert all("reply_markup" not in result for result in results)
-
-
-async def test_without_preview_and_short_name_only_text_remains():
+async def test_only_text_when_bot_username_is_missing(monkeypatch: pytest.MonkeyPatch):
+    """Нет ни превью, ни мини-аппа (пустой BOT_USERNAME) — честный текстовый фолбэк."""
+    monkeypatch.setattr(settings, "bot_username", "")
     store = FakeStore(cached())
     api = FakeAPI()
     configure(store, api)
@@ -247,9 +275,14 @@ async def test_without_preview_and_short_name_only_text_remains():
 
     results = _results(api)
     assert [result["id"] for result in results] == [f"{CMP_ID}-text"]
-    assert results[0]["type"] == "article"
-    assert "html" not in results[0]["input_message_content"]
-    assert "Откройте бота в личке" in results[0]["input_message_content"]["message_text"]
+    text_result = results[0]
+    assert text_result["type"] == "article"
+    assert text_result["title"] == f"Сравнение #{CMP_ID} · только текст"
+    assert "reply_markup" not in text_result
+    assert "html" not in text_result["input_message_content"]
+    message_text = text_result["input_message_content"]["message_text"]
+    assert message_text.startswith(f"Сравнение #{CMP_ID}")
+    assert "Откройте бота в личке" in message_text
 
 
 def test_start_token_is_short_base64url_and_stable():
@@ -272,7 +305,8 @@ def test_start_token_is_short_base64url_and_stable():
 # ------------------------------------------------------------- found / missing
 
 
-async def test_own_comparison_returns_one_text_article():
+async def test_own_comparison_returns_open_article():
+    """Без превью остаётся один article «Открыть сравнение» с кнопкой."""
     store = FakeStore(cached())
     api = FakeAPI()
     configure(store, api)
@@ -287,13 +321,14 @@ async def test_own_comparison_returns_one_text_article():
 
     article = _article(api)
     assert article["type"] == "article"
-    assert article["id"] == f"{CMP_ID}-text"
-    assert article["title"] == f"Сравнение #{CMP_ID}"
+    assert article["id"] == f"{CMP_ID}-open"
+    assert article["title"] == "Открыть сравнение"
     # По умолчанию widget-контента в inline нет: бета его отклоняет.
     assert set(article["input_message_content"]) == {"message_text"}
     assert article["input_message_content"]["message_text"].startswith(
         f"Сравнение #{CMP_ID}"
     )
+    _assert_main_app_token(_button_url(article))
 
 
 async def test_widget_result_included_when_enabled(monkeypatch: pytest.MonkeyPatch):
@@ -306,7 +341,7 @@ async def test_widget_result_included_when_enabled(monkeypatch: pytest.MonkeyPat
     assert await compare_inline.try_answer(make_query(f"#{CMP_ID}")) is True
 
     results = _results(api)
-    assert [result["id"] for result in results] == [f"{CMP_ID}-text", CMP_ID]
+    assert [result["id"] for result in results] == [f"{CMP_ID}-open", CMP_ID]
     widget = results[-1]
     assert "html" in widget["input_message_content"]
     assert widget["input_message_content"]["width"] == 0
@@ -338,7 +373,6 @@ async def test_refused_widget_is_retried_without_it(monkeypatch: pytest.MonkeyPa
     assert [result["id"] for result in results] == [
         f"{CMP_ID}-photo",
         f"{CMP_ID}-open",
-        f"{CMP_ID}-text",
     ]
     assert all("html" not in (result.get("input_message_content") or {}) for result in results)
 
@@ -385,7 +419,7 @@ async def test_share_by_id_finds_foreign_comparison(monkeypatch: pytest.MonkeyPa
     assert await compare_inline.try_answer(make_query(f"#{CMP_ID}")) is True
 
     assert store.calls == [(CMP_ID, None)]
-    assert _article(api)["id"] == f"{CMP_ID}-text"
+    assert _article(api)["id"] == f"{CMP_ID}-open"
 
 
 async def test_unknown_number_returns_missing_hint():
@@ -458,7 +492,6 @@ async def test_widget_api_error_does_not_break_multi_result_answer(monkeypatch: 
     assert [result["id"] for result in _results(api)] == [
         f"{CMP_ID}-photo",
         f"{CMP_ID}-open",
-        f"{CMP_ID}-text",
     ]
 
 

@@ -119,6 +119,21 @@ async def setup_compare() -> None:
         await store.count(),
     )
 
+    # Форма ссылки в inline-кнопке «Открыть сравнение»: пустой short name —
+    # валидная конфигурация Main Mini App, а не ошибка.
+    short_name = settings.cmp_webapp_short_name.strip()
+    if short_name:
+        log.info(
+            "Кнопка мини-аппа: https://t.me/%s/%s?startapp=…",
+            settings.bot_username,
+            short_name,
+        )
+    else:
+        log.info(
+            "Кнопка мини-аппа: https://t.me/%s?startapp=… (Main Mini App)",
+            settings.bot_username,
+        )
+
 
 def _remove_originals(cmp_id: str) -> None:
     """Колбэк `store.purge`: удаляет файлы оригиналов вместе с записью кеша."""
