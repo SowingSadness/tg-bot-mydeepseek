@@ -25,6 +25,10 @@ PAGE_FILE = STATIC_DIR / "cmp.html"
 PAGE = PAGE_FILE.read_text(encoding="utf-8")
 #: Единственный разрешённый внешний ресурс: официальный скрипт Telegram WebApp.
 TELEGRAM_SCRIPT = "https://telegram.org/js/telegram-web-app.js"
+#: Размер страницы до добавления репортёра ошибок (замер перед шагом 3), байт.
+PAGE_BYTES_BEFORE_REPORTER = 25197
+#: Репортёр не должен раздувать единственный файл страницы сильнее, чем на 3 КБ.
+PAGE_BYTES_BUDGET = PAGE_BYTES_BEFORE_REPORTER + 3 * 1024
 
 
 @pytest.fixture
@@ -139,6 +143,64 @@ def test_page_needs_no_separate_assets() -> None:
     assert not (STATIC_DIR / "cmp.js").exists()
     assert not (STATIC_DIR / "cmp.css").exists()
     assert sorted(path.name for path in STATIC_DIR.iterdir()) == ["cmp.html"]
+
+
+# --------------------------------------------------- отчёт об ошибках клиента
+
+
+def test_page_reports_client_errors_to_webapp_log() -> None:
+    """Ошибки страницы уходят на `POST /api/cmp/log`, а не только в `console`.
+
+    В WebView Telegram консоли не видно, поэтому репортёр шлёт JSON с токеном,
+    уровнем, сообщением и местом ошибки, не дожидаясь закрытия страницы
+    (`keepalive`), и глотает собственные сбои (`.catch`).
+    """
+    assert "/api/cmp/log" in PAGE
+    assert "keepalive: true" in PAGE
+    assert "'Content-Type': 'application/json'" in PAGE
+    assert "unhandledrejection" in PAGE
+    assert "addEventListener('error'" in PAGE
+    assert "addEventListener('unhandledrejection'" in PAGE
+    # Дедупликация: одна и та же ошибка не должна лететь дважды.
+    assert "new Set()" in PAGE
+    assert "reported.has(" in PAGE and "reported.add(" in PAGE
+    # Отправка не должна порождать необработанный промис.
+    assert ".catch(function () {" in PAGE
+    # Без известного токена отчёт не отправляется вовсе.
+    assert "if (!token) return;" in PAGE
+
+
+@pytest.mark.parametrize(
+    "needle",
+    [
+        # Явные отчёты из мест, где ошибка уже поймана в `catch`/`onerror`.
+        "report('error'",
+        "report('warning'",
+        "'window'",
+        "'promise'",
+        "'load'",
+        "'image'",
+        "'sdk'",
+        "'Telegram.WebApp нет'",
+    ],
+)
+def test_page_has_explicit_error_reports(needle: str) -> None:
+    """Репортёр вызывается и явно: данные, картинки, отсутствие SDK, глобально."""
+    assert needle in PAGE
+
+
+def test_page_size_stays_within_reporter_budget() -> None:
+    """Репортёр — компактный: страница выросла не больше чем на 3 КБ."""
+    size = PAGE_FILE.stat().st_size
+    assert size <= PAGE_BYTES_BUDGET, (
+        f"cmp.html вырос до {size} байт; бюджет после репортёра — "
+        f"{PAGE_BYTES_BUDGET} байт (до шага было {PAGE_BYTES_BEFORE_REPORTER})"
+    )
+
+
+def test_error_reporter_adds_no_external_resources() -> None:
+    """Репортёр не тянет внешних библиотек: единственный URL — скрипт Telegram."""
+    assert set(re.findall(r"https?://[^\s\"'<>]+", PAGE)) == {TELEGRAM_SCRIPT}
 
 
 # ------------------------------------------------------------------- роутинг

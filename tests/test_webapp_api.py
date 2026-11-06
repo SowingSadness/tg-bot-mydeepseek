@@ -15,19 +15,22 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
+import logging
 import time
 from io import BytesIO
 from pathlib import Path
 from urllib.parse import urlencode
 
 import pytest
+from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
+from aiohttp.web_runner import AppRunner
 from PIL import Image, features
 
 from bot.compare import originals, webauth
 from bot.compare.store import ComparisonStore
 from bot.config import settings
-from bot.webapp.api import build_webapp_app
+from bot.webapp.api import CLIENT_LOGS_KEY, build_webapp_app
 
 BOT_TOKEN = settings.telegram_bot_token
 OWNER_ID = 7
@@ -84,6 +87,18 @@ def auth(init_data: str | None = None) -> dict[str, str]:
 # ------------------------------------------------------------------- fixtures
 
 
+class QuietTestServer(TestServer):
+    """`TestServer` без access-лога — как `AppRunner(app, access_log=None)` в `bot/main.py`.
+
+    Иначе aiohttp пишет в `caplog` полный URL с `startapp`-токеном, и проверка
+    «в логах нет токена» проверяла бы не наш код, а стандартный лог.
+    """
+
+    async def _make_runner(self, **kwargs):
+        kwargs["access_log"] = None
+        return AppRunner(self.app, **kwargs)
+
+
 @pytest.fixture
 def cache_dir(tmp_path: Path) -> Path:
     return tmp_path / "cache"
@@ -126,7 +141,7 @@ def app(store: ComparisonStore, cache_dir: Path):
 
 @pytest.fixture
 async def client(app):
-    async with TestClient(TestServer(app)) as client:
+    async with TestClient(QuietTestServer(app)) as client:
         yield client
 
 
@@ -367,3 +382,317 @@ async def test_page_served_from_static_dir(
             assert response.status == 200
             assert response.headers["Content-Type"].startswith("text/html")
             assert "cmp" in await response.text()
+
+
+# ------------------------------------------------------- журнал запросов
+
+
+def webapp_lines(caplog: pytest.LogCaptureFixture, *, prefix: str = "webapp ") -> list:
+    """Записи лога с началом `prefix` — только строки middleware, без прочего шума."""
+    return [record for record in caplog.records if record.getMessage().startswith(prefix)]
+
+
+async def test_request_logged_at_info_without_token(
+    client: TestClient, cmp_id: str, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Один `INFO`-рядок о запросе, с `user=`, но без `startapp`-токена."""
+    token = webauth.sign(cmp_id)
+    with caplog.at_level(logging.INFO):
+        response = await client.get(f"/api/cmp/{token}", headers=auth())
+    assert response.status == 200
+
+    lines = [record for record in webapp_lines(caplog) if "webapp GET" in record.getMessage()]
+    assert len(lines) == 1
+    line = lines[0].getMessage()
+    assert lines[0].levelno == logging.INFO
+    assert " 200 " in line
+    assert f"user={OWNER_ID}" in line
+    assert token not in caplog.text
+    assert "init_data" not in caplog.text
+
+
+async def test_query_init_data_value_is_redacted_in_log(
+    client: TestClient, cmp_id: str, caplog: pytest.LogCaptureFixture
+) -> None:
+    """`?init_data=` в лог не попадает (значение маскируется)."""
+    init_data = make_init_data()
+    with caplog.at_level(logging.INFO):
+        response = await client.get(
+            f"/api/cmp/{webauth.sign(cmp_id)}", params={"init_data": init_data}
+        )
+    assert response.status == 200
+    assert init_data not in caplog.text
+    assert "init_data=<redacted>" in caplog.text
+
+
+async def test_broken_token_logged_as_warning(
+    client: TestClient, caplog: pytest.LogCaptureFixture
+) -> None:
+    token = f"{MISSING_ID}_AAAAAAAAAAAAAAAAAAAA"
+    with caplog.at_level(logging.INFO):
+        response = await client.get(f"/api/cmp/{token}", headers=auth())
+    assert response.status == 403
+
+    warnings = [
+        record
+        for record in webapp_lines(caplog)
+        if record.levelno == logging.WARNING and "webapp GET" in record.getMessage()
+    ]
+    assert len(warnings) == 1
+    assert " 403 " in warnings[0].getMessage()
+    assert token not in caplog.text
+
+
+async def test_http_exception_logged_as_single_warning(
+    store: ComparisonStore, cache_dir: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """`web.HTTPException` из хендлера: одна WARNING-строка с его статусом."""
+    app = build_webapp_app(store=store, cache_dir=cache_dir, bot_token=BOT_TOKEN)
+
+    async def forbidden(request: web.Request) -> web.Response:
+        raise web.HTTPForbidden()
+
+    app.router.add_get("/forbidden", forbidden)
+    async with TestClient(QuietTestServer(app)) as client:
+        with caplog.at_level(logging.INFO):
+            response = await client.get("/forbidden")
+    assert response.status == 403
+
+    warnings = [
+        record for record in webapp_lines(caplog) if record.levelno == logging.WARNING
+    ]
+    assert len(warnings) == 1
+    assert "webapp GET /forbidden 403" in warnings[0].getMessage()
+
+
+async def test_unhandled_exception_logged_as_error(
+    store: ComparisonStore, cache_dir: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Необработанное исключение хендлера: одна ERROR-строка со статусом 500."""
+    app = build_webapp_app(store=store, cache_dir=cache_dir, bot_token=BOT_TOKEN)
+
+    async def boom(request: web.Request) -> web.Response:
+        raise RuntimeError("boom")
+
+    app.router.add_get("/boom", boom)
+    async with TestClient(QuietTestServer(app)) as client:
+        with caplog.at_level(logging.INFO):
+            response = await client.get("/boom")
+    assert response.status == 500
+
+    errors = [
+        record for record in webapp_lines(caplog) if record.levelno == logging.ERROR
+    ]
+    assert len(errors) == 1
+    assert "webapp GET /boom 500" in errors[0].getMessage()
+
+
+
+async def test_healthz_logged_at_info(
+    client: TestClient, caplog: pytest.LogCaptureFixture
+) -> None:
+    with caplog.at_level(logging.INFO):
+        response = await client.get("/healthz")
+    assert response.status == 200
+
+    lines = [
+        record
+        for record in webapp_lines(caplog)
+        if "webapp GET /healthz 200" in record.getMessage()
+    ]
+    assert len(lines) == 1
+    assert lines[0].levelno == logging.INFO
+    assert "user=" not in lines[0].getMessage()
+
+
+# --------------------------------------------------- клиентские отчёты
+
+
+async def test_client_log_fields_are_redacted_and_single_line(
+    client: TestClient, cmp_id: str, caplog: pytest.LogCaptureFixture
+) -> None:
+    """`message`/`where` схлопываются в одну строку и теряют токен."""
+    token = webauth.sign(cmp_id)
+    with caplog.at_level(logging.INFO):
+        response = await client.post(
+            "/api/cmp/log",
+            json={
+                "token": token,
+                "message": "boom\nINJECTED",
+                "where": "482913_AbC-123_x\r\nFAKE",
+            },
+        )
+    assert response.status == 204
+
+    records = [
+        record for record in caplog.records if "webapp[client]" in record.getMessage()
+    ]
+    assert len(records) == 1
+    line = records[0].getMessage()
+    assert "\n" not in line and "\r" not in line
+    assert "boom INJECTED" in line  # текст остался, но в той же строке
+    assert "\nINJECTED" not in caplog.text
+    assert "482913_AbC-123_x" not in caplog.text
+    assert "<token>" in line
+    assert "FAKE" in line
+
+
+async def test_client_log_written_as_error(
+    client: TestClient, cmp_id: str, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Валидный токен: `204` и `ERROR`-строка `webapp[client]` с текстом."""
+    token = webauth.sign(cmp_id)
+    with caplog.at_level(logging.INFO):
+        response = await client.post(
+            "/api/cmp/log",
+            json={"token": token, "message": "boom", "where": "load"},
+        )
+    assert response.status == 204
+
+    records = [
+        record
+        for record in caplog.records
+        if "webapp[client]" in record.getMessage()
+    ]
+    assert len(records) == 1
+    assert records[0].levelno == logging.ERROR
+    line = records[0].getMessage()
+    assert "boom" in line
+    assert "where=load" in line
+    assert f"cmp={cmp_id}" in line
+    assert token not in caplog.text
+
+
+async def test_client_log_level_warning(
+    client: TestClient, cmp_id: str, caplog: pytest.LogCaptureFixture
+) -> None:
+    token = webauth.sign(cmp_id)
+    with caplog.at_level(logging.INFO):
+        response = await client.post(
+            "/api/cmp/log",
+            json={"token": token, "level": "warning", "message": "hm"},
+        )
+    assert response.status == 204
+    records = [
+        record
+        for record in caplog.records
+        if "webapp[client]" in record.getMessage()
+    ]
+    assert len(records) == 1
+    assert records[0].levelno == logging.WARNING
+
+
+async def test_client_log_without_token_is_forbidden_and_silent(
+    client: TestClient, caplog: pytest.LogCaptureFixture
+) -> None:
+    with caplog.at_level(logging.INFO):
+        no_token = await client.post("/api/cmp/log", json={"message": "boom"})
+        broken = await client.post(
+            "/api/cmp/log", json={"token": "bad", "message": "boom"}
+        )
+    assert no_token.status == 403
+    assert broken.status == 403
+    assert "webapp[client]" not in caplog.text
+
+
+async def test_client_log_message_too_long(
+    client: TestClient, cmp_id: str, caplog: pytest.LogCaptureFixture
+) -> None:
+    token = webauth.sign(cmp_id)
+    with caplog.at_level(logging.INFO):
+        response = await client.post(
+            "/api/cmp/log", json={"token": token, "message": "x" * 501}
+        )
+    assert response.status == 413
+    assert "webapp[client]" not in caplog.text
+
+
+async def test_client_log_body_too_large(
+    client: TestClient, cmp_id: str
+) -> None:
+    """Тело больше `client_max_size` (8 КБ) — 413 от aiohttp."""
+    token = webauth.sign(cmp_id)
+    response = await client.post(
+        "/api/cmp/log",
+        json={"token": token, "message": "boom", "url": "u" * 9000},
+    )
+    assert response.status == 413
+
+
+async def test_client_log_empty_message_is_bad_request(
+    client: TestClient, cmp_id: str
+) -> None:
+    token = webauth.sign(cmp_id)
+    for payload in (
+        {"token": token, "message": "   "},
+        {"token": token, "message": 42},
+        {"token": token},
+    ):
+        response = await client.post("/api/cmp/log", json=payload)
+        assert response.status == 400
+
+
+async def test_client_log_rate_limited_to_30_per_minute(
+    client: TestClient, cmp_id: str, caplog: pytest.LogCaptureFixture
+) -> None:
+    """31-е сообщение в минуту — `204`, но в лог не пишется."""
+    token = webauth.sign(cmp_id)
+    with caplog.at_level(logging.INFO):
+        for index in range(31):
+            response = await client.post(
+                "/api/cmp/log",
+                json={"token": token, "message": f"boom {index}", "where": "load"},
+            )
+            assert response.status == 204
+
+    records = [
+        record
+        for record in caplog.records
+        if "webapp[client]" in record.getMessage()
+    ]
+    assert len(records) == 30
+
+
+async def test_client_log_prunes_dead_keys_after_window(
+    client: TestClient,
+    app,
+    cmp_id: str,
+    caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Ключи лимита без свежих отчётов удаляются, лимит токена начинается заново."""
+    token = webauth.sign(cmp_id)
+    other = webauth.sign("12345")
+    clock = [1000.0]
+    monkeypatch.setattr("bot.webapp.api._now", lambda: clock[0])
+    logs = app[CLIENT_LOGS_KEY]
+
+    with caplog.at_level(logging.INFO):
+        for index in range(30):
+            response = await client.post(
+                "/api/cmp/log", json={"token": token, "message": f"boom {index}"}
+            )
+            assert response.status == 204
+    key = hashlib.sha256(token.encode()).hexdigest()
+    other_key = hashlib.sha256(other.encode()).hexdigest()
+    assert len(logs[key]) == 30
+
+    clock[0] += 61.0
+    with caplog.at_level(logging.INFO):
+        probe = await client.post(
+            "/api/cmp/log", json={"token": other, "message": "probe"}
+        )
+    assert probe.status == 204
+    assert key not in logs
+    assert other_key in logs
+
+    with caplog.at_level(logging.INFO):
+        for index in range(30):
+            response = await client.post(
+                "/api/cmp/log", json={"token": token, "message": f"again {index}"}
+            )
+            assert response.status == 204
+    records = [
+        record for record in caplog.records if "webapp[client]" in record.getMessage()
+    ]
+    assert len(records) == 30 + 1 + 30

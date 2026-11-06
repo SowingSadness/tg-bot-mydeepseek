@@ -29,6 +29,29 @@ _DATA_URI_RE = re.compile(
 #: Короткие data-URI не трогаем, длинные — сжимаем до маркера.
 MIN_DATA_URI = 64
 
+#: Чувствительные query-параметры мини-аппа: их значения в лог не попадают.
+_SENSITIVE_QUERY_KEYS: tuple[str, ...] = (
+    "tgWebAppData",
+    "init_data",
+    "startapp",
+    "hash",
+    "t",
+)
+
+#: `key=value` в query/фрагменте; `#` — чтобы ловить `#tgWebAppData=…`.
+_SENSITIVE_QUERY_RE = re.compile(
+    r"(?i)(?P<sep>^|[?&#])(?P<key>"
+    + "|".join(_SENSITIVE_QUERY_KEYS)
+    + r")=[^&#]*"
+)
+
+#: Токен `startapp` в пути: сегмент сразу после `/app/cmp/img/` или `/api/cmp/`.
+#: `/api/cmp/log` — не токен, его не трогаем.
+_URL_TOKEN_PATH_RE = re.compile(
+    r"(?i)(?P<prefix>/app/cmp/img/)[^/?#&]+"
+    r"|(?P<api>/api/cmp/)(?!log(?:$|[?#/&]))[^/?#&]+"
+)
+
 #: Поля `Update`, по которым определяется тип апдейта (порядок важен).
 _UPDATE_FIELDS: tuple[str, ...] = (
     "message",
@@ -126,6 +149,73 @@ def _shrink_data_uri(match: re.Match[str]) -> str:
     if len(payload) <= MIN_DATA_URI:
         return match.group(0)
     return f"data:{match.group('mime')};{len(payload)}chars"
+
+
+# --------------------------------------------------------------------- мини-апп
+
+
+def redact_url(path_with_query: str) -> str:
+    """Маскирует токены мини-аппа в пути и query-строке, не ломая остальное.
+
+    Значения параметров `t`, `init_data`, `startapp`, `tgWebAppData`, `hash`
+    заменяются на `<redacted>`, сегмент-токен после `/app/cmp/img/` (и
+    `/api/cmp/`) — на `<token>`. Остальные параметры и их порядок сохраняются.
+    В конце применяется `redact()` — на случай токена бота или `data:`-URI.
+
+    Никогда не бросает исключений: `None` → `""`, а строки без `/` и `?`
+    (обычный текст) возвращаются без изменений.
+    """
+    if path_with_query is None:
+        return ""
+    try:
+        value = str(path_with_query)
+    except Exception:  # noqa: BLE001 — лог не имеет права падать
+        return ""
+    if "/" not in value and "?" not in value:
+        return value
+    try:
+        value = _URL_TOKEN_PATH_RE.sub(_mask_url_token, value)
+        value = _SENSITIVE_QUERY_RE.sub(_mask_query_value, value)
+        return redact(value)
+    except Exception:  # noqa: BLE001
+        return redact(value) if isinstance(value, str) else ""
+
+
+def _mask_url_token(match: re.Match[str]) -> str:
+    prefix = match.group("prefix") or match.group("api") or ""
+    return f"{prefix}<token>"
+
+
+def _mask_query_value(match: re.Match[str]) -> str:
+    return f"{match.group('sep')}{match.group('key')}=<redacted>"
+
+
+def describe_webapp_request(
+    method: str,
+    path: str,
+    status: int,
+    ms: float,
+    *,
+    user_id: int | None = None,
+) -> str:
+    """Одна строка о запросе к мини-аппу: `webapp GET /api/cmp/<token> 200 12ms`.
+
+    `user_id` добавляется только когда известен (валидный `initData`); путь
+    проходит через `redact_url`, поэтому токен в лог не попадает.
+    """
+    try:
+        parts = [
+            "webapp",
+            _one_line(str(method or "?").upper(), 16),
+            redact_url(path),
+            str(status),
+            f"{max(0, int(float(ms) + 0.5))}ms",
+        ]
+        if user_id is not None:
+            parts.append(f"user={user_id}")
+        return _one_line(redact(" ".join(parts)), limit=1000)
+    except Exception:  # noqa: BLE001 — лог не имеет права падать
+        return "webapp (не удалось разобрать запрос)"
 
 
 # --------------------------------------------------------------------- helpers
@@ -367,6 +457,8 @@ __all__ = [
     "describe_api_call",
     "describe_api_response",
     "describe_update",
+    "describe_webapp_request",
     "redact",
+    "redact_url",
     "setup_logging",
 ]

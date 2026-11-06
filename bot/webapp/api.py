@@ -17,7 +17,14 @@
   неизвестной стороны/отсутствующего файла; иначе AVIF при
   ``Accept: image/avif`` (с фолбэком на WebP), ``Vary: Accept``,
   ``Cache-Control: immutable`` и ``ETag``; ``If-None-Match`` → 304 без тела;
-* ``GET /app/cmp`` и ``/app/cmp/`` → ``static_dir/cmp.html`` или 404.
+* ``POST /api/cmp/log`` → 204, если клиентский отчёт об ошибке принят; 403 при
+  битом/отсутствующем токене, 400 для пустого/не-JSON ``message``, 413 для
+  сообщения длиннее 500 символов или тела больше 8 КБ; не больше 30 отчётов
+  в минуту на токен (лишние тихо отбрасываются с тем же 204); ``message`` и
+  ``where`` схлопываются в одну строку и проходят ``redact()``;
+* каждый запрос даёт ровно одну строку лога (`INFO` < 400, `WARNING` 4xx,
+  `ERROR` 5xx) с замаскированным токеном — это делает middleware
+  `log_requests`, а не `access_log` (он остаётся `None`).
 
 Безопасность: значение ``side`` допускается только ``a``/``b``, номер
 сравнения берётся из проверенной подписи (только цифры), путь к файлу строится
@@ -31,12 +38,15 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import logging
+import re
+import time
 from pathlib import Path
 
 from aiohttp import web
 
 from ..compare import originals, webauth
 from ..compare.build import _height_for
+from ..logging_setup import _one_line, describe_webapp_request, redact
 
 log = logging.getLogger(__name__)
 
@@ -52,6 +62,40 @@ PAGE_FILE = "cmp.html"
 IMMUTABLE_CACHE = "public, max-age=31536000, immutable"
 #: Сколько символов sha256 оставляем в `ETag` (достаточно и коротко).
 ETAG_LEN = 32
+#: Предел тела `POST /api/cmp/log`: больше — 413 от aiohttp.
+CLIENT_LOG_MAX_BODY = 8 * 1024
+#: Максимальная длина клиентского сообщения в символах.
+CLIENT_LOG_MAX_MESSAGE = 500
+#: Максимальная длина поля `where` в символах.
+CLIENT_LOG_MAX_WHERE = 100
+#: Лимит клиентских отчётов в минуту на один токен.
+CLIENT_LOG_LIMIT = 30
+#: Окно лимита в секундах.
+CLIENT_LOG_WINDOW = 60.0
+#: Допустимые уровни клиентского отчёта; всё остальное — `error`.
+CLIENT_LOG_LEVELS = {
+    "error": logging.ERROR,
+    "warning": logging.WARNING,
+    "info": logging.INFO,
+}
+
+#: Текст, похожий на `startapp`-токен (`<цифры>_<base64url>`): `redact()`
+#: вырезает только токен бота (`<id>:<secret>`), а такой токен из клиентского
+#: поля тоже не должен попадать в лог.
+_TOKEN_LIKE_RE = re.compile(r"\d{1,16}_[A-Za-z0-9_-]{8,}")
+
+#: Ключ `app` со счётчиками лимита клиентских отчётов (виден тестам).
+CLIENT_LOGS_KEY: web.AppKey[dict[str, list[float]]] = web.AppKey("client_logs", dict)
+
+
+def _now() -> float:
+    """Монотонное время лимита; вынесено, чтобы тесты могли сдвигать окно."""
+    return time.monotonic()
+
+
+def _client_text(value: str, limit: int) -> str:
+    """Клиентский текст для лога: без токенов, переводов строк и лишних пробелов."""
+    return _one_line(redact(_TOKEN_LIKE_RE.sub("<token>", value)), limit=limit)
 
 
 def _error(status: int, message: str) -> web.Response:
@@ -109,6 +153,48 @@ def _image_headers(content_type: str, etag: str) -> dict[str, str]:
     }
 
 
+@web.middleware
+async def log_requests(request: web.Request, handler) -> web.StreamResponse:
+    """Одна строка о каждом запросе мини-аппа, в том числе об ошибке.
+
+    Путь и query проходят через `describe_webapp_request` → `redact_url`,
+    поэтому `startapp`-токен и `init_data` в лог не попадают. Статус берётся
+    из ответа, а для `web.HTTPException` — из исключения; само исключение
+    пробрасывается дальше без изменений.
+    """
+    started = time.perf_counter()
+    status = 500
+    try:
+        response = await handler(request)
+        status = response.status
+        return response
+    except web.HTTPException as exc:
+        status = exc.status
+        raise
+    except Exception:  # noqa: BLE001 — статус для лога, исключение уходит выше
+        status = 500
+        raise
+    finally:
+        elapsed_ms = (time.perf_counter() - started) * 1000
+        if status < 400:
+            level = logging.INFO
+        elif status < 500:
+            level = logging.WARNING
+        else:
+            level = logging.ERROR
+        log.log(
+            level,
+            "%s",
+            describe_webapp_request(
+                request.method,
+                request.path_qs,
+                status,
+                elapsed_ms,
+                user_id=request.get("webapp_user_id"),
+            ),
+        )
+
+
 def build_webapp_app(
     *,
     store,
@@ -128,7 +214,20 @@ def build_webapp_app(
     ``static_dir`` — каталог со страницей `cmp.html` (нет файла — 404, шаг 6).
 
     Зависимости захвачены замыканиями: глобального состояния у приложения нет.
+    Счётчики лимита клиентских отчётов тоже живут в замыкании: у каждого
+    приложения свой словарь `{sha256(token): [monotonic timestamps]}`.
     """
+    client_logs: dict[str, list[float]] = {}
+
+    def _prune_client_logs(now: float) -> None:
+        """Удаляет ключи лимита, чей последний отчёт старше окна."""
+        stale = [
+            key
+            for key, stamps in client_logs.items()
+            if not stamps or now - stamps[-1] >= CLIENT_LOG_WINDOW
+        ]
+        for key in stale:
+            client_logs.pop(key, None)
 
     async def healthz(request: web.Request) -> web.Response:
         """Живость сервера: без БД, диска и авторизации."""
@@ -146,6 +245,8 @@ def build_webapp_app(
         parsed = webauth.parse_init_data(init_data, bot_token)
         if parsed is None:
             return _error(401, "Не удалось проверить данные Telegram")
+        # Для middleware: чей это запрос (картинки и /healthz идут без user).
+        request["webapp_user_id"] = _user_id(parsed["user"])
 
         try:
             cached = await store.get(cmp_id)
@@ -212,6 +313,68 @@ def build_webapp_app(
             return web.Response(status=304, headers=headers)
         return web.Response(body=blob, headers=headers)
 
+    async def client_log(request: web.Request) -> web.Response:
+        """Клиентский отчёт об ошибке из самой страницы мини-аппа.
+
+        Токен обязателен и проверяется подписью: без него в лог не пишется
+        ничего. `url` (страница, где случилась ошибка) намеренно не логируем.
+        Лимит — 30 отчётов в минуту на токен, сверх — тихий `204`.
+        """
+        try:
+            data = await request.json()
+        except web.HTTPRequestEntityTooLarge:
+            return _error(413, "Слишком большое сообщение")
+        except (ValueError, web.HTTPException):
+            return _error(400, "Ожидается JSON")
+        if not isinstance(data, dict):
+            return _error(400, "Ожидается JSON-объект")
+
+        raw_token = data.get("token")
+        cmp_id = webauth.verify(raw_token) if isinstance(raw_token, str) else None
+        if cmp_id is None:
+            return _error(403, "Ссылка недействительна")
+
+        message = data.get("message")
+        if not isinstance(message, str) or not message.strip():
+            return _error(400, "Пустое сообщение")
+        if len(message) > CLIENT_LOG_MAX_MESSAGE:
+            return _error(413, "Слишком длинное сообщение")
+
+        level_name = data.get("level")
+        level = CLIENT_LOG_LEVELS.get(
+            level_name.strip().lower() if isinstance(level_name, str) else "",
+            logging.ERROR,
+        )
+        where = data.get("where")
+        where = (
+            _client_text(where, CLIENT_LOG_MAX_WHERE) if isinstance(where, str) else ""
+        )
+
+        key = hashlib.sha256(raw_token.encode()).hexdigest()
+        now = _now()
+        # Каждый вызов подчищает ключи, у которых последний отчёт уже вне окна:
+        # иначе словарь лимита растёт вместе с числом разных токенов.
+        _prune_client_logs(now)
+        recent = [
+            stamp
+            for stamp in client_logs.get(key, ())
+            if now - stamp < CLIENT_LOG_WINDOW
+        ]
+        if len(recent) >= CLIENT_LOG_LIMIT:
+            client_logs[key] = recent
+            return web.Response(status=204)
+        recent.append(now)
+        client_logs[key] = recent
+
+        log.log(
+            level,
+            "webapp[client] cmp=%s where=%s message=%s",
+            cmp_id,
+            where or "-",
+            _client_text(message, CLIENT_LOG_MAX_MESSAGE),
+        )
+        return web.Response(status=204)
+
     async def page(request: web.Request) -> web.Response:
         """Статическая страница мини-аппа; без `static_dir`/файла — 404."""
         if static_dir is None:
@@ -224,9 +387,13 @@ def build_webapp_app(
         except OSError:
             return _error(404, "Страница мини-аппа не найдена")
 
-    app = web.Application()
+    app = web.Application(client_max_size=CLIENT_LOG_MAX_BODY)
+    #: Состояние лимита клиентских отчётов — видно тестам и диагностике.
+    app[CLIENT_LOGS_KEY] = client_logs
+    app.middlewares.append(log_requests)
     app.router.add_get("/healthz", healthz)
     app.router.add_get("/api/cmp/{token}", comparison)
+    app.router.add_post("/api/cmp/log", client_log)
     app.router.add_get("/app/cmp/img/{token}/{side}", image)
     app.router.add_get("/app/cmp", page)
     app.router.add_get("/app/cmp/", page)

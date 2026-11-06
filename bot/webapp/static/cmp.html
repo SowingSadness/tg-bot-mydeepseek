@@ -172,6 +172,42 @@ var state = {
 var lastTapAt = 0;
 var resizeTimer = 0;
 
+// --------------------------------------------------------- отчёт об ошибках
+// В WebView Telegram консоль не видна, поэтому ошибки страницы уходят на сервер
+// (`POST /api/cmp/log`, JSON) и попадают в общий лог бота. Одна ошибка — один
+// отчёт (дедупликация), без токена не отправляем ничего, наружу не бросаем.
+var reported = new Set();
+
+function report(level, message, where) {
+  try {
+    var token = startToken();
+    if (!token) return;
+    var text = String(message === undefined || message === null ? 'unknown' : message).slice(0, 500);
+    var place = String(where || '').slice(0, 100);
+    var key = level + '|' + place + '|' + text;
+    if (reported.has(key)) return;
+    reported.add(key);
+    if (typeof window.fetch !== 'function') return;
+    window.fetch('/api/cmp/log', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      credentials: 'omit',
+      cache: 'no-store',
+      keepalive: true,
+      body: JSON.stringify({ token: token, level: level, message: text, where: place })
+    }).catch(function () { /* отчёт — не повод ломать страницу */ });
+  } catch (err) { /* репортёр молчит всегда */ }
+}
+
+window.addEventListener('error', function (event) {
+  report('error', (event && event.message) || 'Ошибка скрипта', 'window');
+});
+
+window.addEventListener('unhandledrejection', function (event) {
+  var reason = event && event.reason;
+  report('error', (reason && reason.message) || reason || 'Отклонённый промис', 'promise');
+});
+
 function clamp(value, low, high) {
   return value < low ? low : (value > high ? high : value);
 }
@@ -264,6 +300,7 @@ function loadImage(url) {
     img.onerror = function () {
       var err = new Error('Не удалось загрузить картинку');
       err.kind = 'image';
+      report('error', err.message, 'image');
       reject(err);
     };
     img.src = url;
@@ -336,16 +373,22 @@ function load() {
     credentials: 'omit',
     cache: 'no-store'
   }).then(function (response) {
-    if (!response.ok) throw retryableError(response.status);
+    if (!response.ok) {
+      var bad = retryableError(response.status);
+      report('error', bad.message, 'load');
+      throw bad;
+    }
     return response.json().catch(function () {
       var err = new Error('Сервер вернул некорректный ответ. Попробуйте ещё раз.');
       err.kind = 'server';
+      report('error', err.message, 'load');
       throw err;
     });
   }).then(function (data) {
     if (!data || !data.images || !data.images.a || !data.images.b) {
       var err = new Error('Сервер вернул неполные данные сравнения. Попробуйте ещё раз.');
       err.kind = 'server';
+      report('error', err.message, 'load');
       throw err;
     }
     state.data = data;
@@ -355,6 +398,7 @@ function load() {
     layout();
   }).catch(function (error) {
     var kind = error && error.kind;
+    if (!kind) report('error', (error && error.message) || error, 'load');
     if (kind === 'image') {
       showScreen('retry', 'Картинки не загрузились', 'Проверьте связь и попробуйте ещё раз.', true);
     } else if (kind === 'stale') {
@@ -758,6 +802,7 @@ try {
 } catch (err) { /* без ResizeObserver хватает resize */ }
 
 function boot() {
+  if (!tg) report('warning', 'Telegram.WebApp нет', 'sdk');
   try {
     if (tg) {
       tg.ready();

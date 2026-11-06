@@ -15,11 +15,16 @@ from bot.logging_setup import (
     describe_api_call,
     describe_api_response,
     describe_update,
+    describe_webapp_request,
     redact,
+    redact_url,
     setup_logging,
 )
 
 DATE = datetime.datetime(2024, 1, 1, tzinfo=datetime.timezone.utc)
+
+#: Токен `startapp` в том виде, в каком он бывает в URL мини-аппа.
+STARTAPP_TOKEN = "482913_AbC-123_x"
 
 
 # --------------------------------------------------------------------- helpers
@@ -121,6 +126,83 @@ def test_redact_keeps_short_data_uri() -> None:
 
 def test_redact_handles_empty_value() -> None:
     assert redact("") == ""
+
+
+# --------------------------------------------------------------------- redact_url
+
+
+def test_redact_url_masks_image_token() -> None:
+    result = redact_url(f"/app/cmp/img/{STARTAPP_TOKEN}/b?v=1")
+    assert result == "/app/cmp/img/<token>/b?v=1"
+    assert STARTAPP_TOKEN not in result
+
+
+def test_redact_url_masks_init_data_and_path_token() -> None:
+    result = redact_url(
+        f"/api/cmp/{STARTAPP_TOKEN}?init_data=user%3D1%26hash%3Dx"
+    )
+    assert STARTAPP_TOKEN not in result
+    assert "user%3D1" not in result
+    assert "init_data=<redacted>" in result
+
+
+def test_redact_url_masks_sensitive_query_keys() -> None:
+    result = redact_url(
+        f"/app/cmp?t={STARTAPP_TOKEN}&v=2&startapp={STARTAPP_TOKEN}#hash=1"
+    )
+    assert STARTAPP_TOKEN not in result
+    assert "t=<redacted>" in result
+    assert "startapp=<redacted>" in result
+    assert "hash=<redacted>" in result
+    # остальные параметры и порядок не тронуты
+    assert result.startswith("/app/cmp?t=<redacted>&v=2&startapp=<redacted>")
+
+
+def test_redact_url_masks_fragment_webapp_data() -> None:
+    result = redact_url("http://h/app/cmp#tgWebAppData=query_id%3D1&tgWebAppVersion=7")
+    assert "query_id" not in result
+    assert "tgWebAppData=<redacted>" in result
+    assert "tgWebAppVersion=7" in result
+
+
+def test_redact_url_keeps_plain_text() -> None:
+    assert redact_url("обычный текст") == "обычный текст"
+    assert redact_url("") == ""
+
+
+def test_redact_url_handles_none() -> None:
+    assert redact_url(None) == ""
+
+
+def test_redact_url_never_raises() -> None:
+    for value in (None, "", "/", "?", "/%%%", 42, object()):
+        assert isinstance(redact_url(value), str)
+
+
+# --------------------------------------------------------------------- webapp
+
+
+def test_describe_webapp_request_has_all_parts() -> None:
+    result = describe_webapp_request(
+        "GET", f"/api/cmp/{STARTAPP_TOKEN}", 200, 12.4, user_id=42
+    )
+    assert result.startswith("webapp GET "), result
+    assert "200" in result
+    assert "12ms" in result
+    assert "user=42" in result
+    assert STARTAPP_TOKEN not in result
+    assert "\n" not in result
+
+
+def test_describe_webapp_request_without_user() -> None:
+    result = describe_webapp_request("POST", "/api/cmp/log", 403, 0.2)
+    assert "user=" not in result
+    assert "0ms" in result
+
+
+def test_describe_webapp_request_keeps_placeholder_path() -> None:
+    result = describe_webapp_request("GET", "/api/cmp/<token>", 200, 12.4, user_id=42)
+    assert "/api/cmp/<token>" in result
 
 
 # --------------------------------------------------------------------- updates
