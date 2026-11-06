@@ -31,7 +31,7 @@ from aiogram.types import BufferedInputFile, InputMediaDocument
 from .. import respond
 from ..config import settings
 from . import api as api_module
-from . import build, images
+from . import build, images, preview
 from .store import ComparisonStore
 
 log = logging.getLogger(__name__)
@@ -95,6 +95,15 @@ def get_store() -> ComparisonStore:
 def _album_wait() -> float:
     """Сколько ждать остальные картинки альбома (тесты подменяют функцию)."""
     return float(settings.cmp_album_wait)
+
+
+def _preview_width() -> int:
+    """Ширина композита-превью: `CMP_PREVIEW_WIDTH`, по умолчанию 2560."""
+    try:
+        width = int(getattr(settings, "cmp_preview_width", 2560))
+    except (TypeError, ValueError):
+        return 2560
+    return width if width >= 2 else 2560
 
 
 def _album_key(message) -> AlbumKey:
@@ -378,12 +387,55 @@ async def compare_images(message, a: bytes, b: bytes) -> None:
             exc.description,
         )
         await _send_fallback(message, caption, built)
-        return
+    else:
+        if settings.cmp_show_hint:
+            await message.answer(
+                f"Номер сравнения: #{cmp_id}. В любом чате: @{settings.bot_username} #{cmp_id}"
+            )
 
-    if settings.cmp_show_hint:
-        await message.answer(
-            f"Номер сравнения: #{cmp_id}. В любом чате: @{settings.bot_username} #{cmp_id}"
+    # Превью — украшение inline-выдачи: его сбой не должен съедать номер и бабл.
+    await _upload_preview(message, cmp_id, img_a, img_b, built, store=store)
+
+
+async def _upload_preview(
+    message,
+    cmp_id: str,
+    img_a,
+    img_b,
+    built: build.Built,
+    *,
+    store: ComparisonStore,
+) -> None:
+    """Загружает композит в Telegram, сразу удаляет сообщение и кеширует `file_id`.
+
+    Композит собирается из тех же `img_a`/`img_b` и того же окна кропа, что и слои
+    бабла (`built.aspect`), поэтому превью совпадает со шторкой по участку сцены.
+    Отправка невидимая (`disable_notification`), а сообщение удаляется сразу:
+    в личке оно нужно только ради `file_id`.
+
+    Рендер PIL (сотни миллисекунд) уводится в поток через `asyncio.to_thread`,
+    чтобы не задерживать event loop; исключение из потока приходит в тот же
+    `try`, поэтому любая ошибка — `log.warning` и возврат: номер и подсказка
+    уже отправлены.
+    """
+    try:
+        jpeg = await asyncio.to_thread(
+            preview.render,
+            img_a,
+            img_b,
+            width=_preview_width(),
+            aspect=built.aspect,
+            labels=settings.cmp_labels_pair,
         )
+        sent = await message.bot.send_photo(
+            message.chat.id,
+            BufferedInputFile(jpeg, filename="cmp-preview.jpg"),
+            disable_notification=True,
+        )
+        await message.bot.delete_message(message.chat.id, sent.message_id)
+        await store.set_preview_file_id(cmp_id, sent.photo[-1].file_id)
+    except Exception as exc:  # noqa: BLE001 — превью не должно ломать /cmp
+        log.warning("Не удалось загрузить превью сравнения #%s: %s", cmp_id, exc)
 
 
 async def _send_fallback(message, caption: str, built: build.Built) -> None:

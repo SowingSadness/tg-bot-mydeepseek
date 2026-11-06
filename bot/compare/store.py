@@ -29,13 +29,15 @@ CREATE TABLE IF NOT EXISTS comparisons (
   zlib_bytes INTEGER NOT NULL,
   image_a    BLOB    NOT NULL,
   image_b    BLOB    NOT NULL,
-  aspect     TEXT    NOT NULL DEFAULT '3:2'
+  aspect     TEXT    NOT NULL DEFAULT '3:2',
+  preview_file_id TEXT
 );
 CREATE INDEX IF NOT EXISTS comparisons_owner ON comparisons(owner_id, created_at DESC);
 """
 
 _COLUMNS = (
-    "id, owner_id, created_at, width, quality, labels, zlib_bytes, image_a, image_b, aspect"
+    "id, owner_id, created_at, width, quality, labels, zlib_bytes, image_a, image_b, aspect,"
+    " preview_file_id"
 )
 
 
@@ -53,6 +55,8 @@ class Cached:
     image_a: bytes
     image_b: bytes
     aspect: str = "3:2"
+    #: `file_id` композита-превью из Telegram; `None` — ещё не загружали (или старая запись).
+    preview_file_id: str | None = None
 
 
 class ComparisonStore:
@@ -79,6 +83,7 @@ class ComparisonStore:
         self._conn.execute("PRAGMA synchronous=NORMAL")
         self._conn.executescript(_SCHEMA)
         self._migrate_aspect(self._conn)
+        self._migrate_preview_file_id(self._conn)
         self._conn.commit()
 
     @staticmethod
@@ -92,6 +97,18 @@ class ComparisonStore:
         columns = {row[1] for row in conn.execute("PRAGMA table_info(comparisons)")}
         if "aspect" not in columns:
             conn.execute("ALTER TABLE comparisons ADD COLUMN aspect TEXT")
+
+    @staticmethod
+    def _migrate_preview_file_id(conn: sqlite3.Connection) -> None:
+        """Добавляет колонку `preview_file_id` в старую БД; старые строки — NULL.
+
+        Заполнять нечем: `file_id` появляется только после реальной загрузки
+        композита в Telegram, поэтому inline просто не покажет фото для старых
+        номеров, пока их не пересоберут.
+        """
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(comparisons)")}
+        if "preview_file_id" not in columns:
+            conn.execute("ALTER TABLE comparisons ADD COLUMN preview_file_id TEXT")
 
     # ------------------------------------------------------------------ helpers
 
@@ -122,12 +139,13 @@ class ComparisonStore:
         image_a: bytes,
         image_b: bytes,
         aspect: str,
+        preview_file_id: str | None,
     ) -> None:
         """Одна попытка INSERT; при конфликте откатывает транзакцию."""
         conn = self._connection()
         try:
             conn.execute(
-                f"INSERT INTO comparisons ({_COLUMNS}) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                f"INSERT INTO comparisons ({_COLUMNS}) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     cmp_id,
                     owner_id,
@@ -139,6 +157,7 @@ class ComparisonStore:
                     image_a,
                     image_b,
                     aspect,
+                    preview_file_id,
                 ),
             )
             conn.commit()
@@ -180,6 +199,19 @@ class ComparisonStore:
         row = self._connection().execute("SELECT COUNT(*) FROM comparisons").fetchone()
         return int(row[0])
 
+    def _set_preview_file_id(self, cmp_id: str, file_id: str) -> None:
+        """UPDATE по номеру; несуществующий номер — тихо ничего не делает."""
+        conn = self._connection()
+        try:
+            conn.execute(
+                "UPDATE comparisons SET preview_file_id = ? WHERE id = ?",
+                (str(file_id), str(cmp_id)),
+            )
+            conn.commit()
+        except BaseException:
+            conn.rollback()
+            raise
+
     def _close(self) -> None:
         if self._conn is None:
             return
@@ -199,6 +231,7 @@ class ComparisonStore:
         labels: tuple[str, str],
         zlib_bytes: int,
         aspect: str = "3:2",
+        preview_file_id: str | None = None,
         now: float | None = None,
     ) -> str:
         """Сохраняет сравнение и возвращает свободный номер (строкой).
@@ -227,6 +260,7 @@ class ComparisonStore:
                         image_a,
                         image_b,
                         str(aspect),
+                        None if preview_file_id is None else str(preview_file_id),
                     )
                 except sqlite3.IntegrityError:
                     attempts += 1
@@ -254,7 +288,17 @@ class ComparisonStore:
             image_b=row[8],
             # NULL — запись из старой БД: она запечена в 4:3, это прежний дефолт.
             aspect=str(row[9] or "4:3"),
+            preview_file_id=None if row[10] is None else str(row[10]),
         )
+
+    async def set_preview_file_id(self, cmp_id: str, file_id: str) -> None:
+        """Запоминает `file_id` композита-превью для номера `cmp_id`.
+
+        Прежние номера, которых уже нет в кеше, не ошибка: превью — украшение,
+        поэтому UPDATE просто ничего не меняет.
+        """
+        async with self._lock:
+            await asyncio.to_thread(self._set_preview_file_id, str(cmp_id), str(file_id))
 
     async def purge(self, *, ttl_seconds: float, max_entries: int) -> int:
         """Удаляет записи старше TTL и лишние сверх `max_entries`.

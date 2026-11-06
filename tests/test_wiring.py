@@ -9,6 +9,7 @@ Store — настоящий SQLite во временном каталоге.
 from __future__ import annotations
 
 import asyncio
+import logging
 import re
 from contextlib import suppress
 from io import BytesIO
@@ -80,16 +81,63 @@ class FakeMessage:
 
 # --------------------------------------------------------------------- тесты
 
+_DISPATCHER = None
+
+
+def _dispatcher():
+    """Один диспетчер на модуль: aiogram запрещает подключать роутеры дважды."""
+    global _DISPATCHER
+    if _DISPATCHER is None:
+        _DISPATCHER = main_module.build_dispatcher()
+    return _DISPATCHER
+
 
 def test_compare_router_goes_before_private() -> None:
     """Иначе catch-all `F.text.startswith("/")` в private съест /cmp."""
-    dispatcher = main_module.build_dispatcher()
+    dispatcher = _dispatcher()
     assert [router.name for router in dispatcher.sub_routers] == [
         "inline",
         "compare",
         "private",
         "group",
     ]
+
+
+async def test_update_middleware_logs_and_calls_handler(caplog) -> None:
+    """DEBUG-лог апдейта не заменяет обработчик и не падает на его вызове."""
+    dispatcher = _dispatcher()
+    middleware = next(
+        item
+        for item in dispatcher.update.outer_middleware
+        if getattr(item, "__name__", "") == "_log_update"
+    )
+
+    seen: list[tuple] = []
+
+    async def handler(event, data):  # noqa: ANN001
+        seen.append((event, data))
+        return "handled"
+
+    event = SimpleNamespace(
+        event_type="message",
+        message=SimpleNamespace(
+            chat=SimpleNamespace(id=777, type="private"),
+            from_user=SimpleNamespace(id=42, username="tester"),
+            message_id=1,
+            text="привет",
+            caption=None,
+            photo=None,
+            document=None,
+            media_group_id=None,
+        ),
+    )
+
+    caplog.set_level(logging.DEBUG)
+    assert await middleware(handler, event, {"bot": None}) == "handled"
+    assert seen and seen[0][0] is event
+    assert "chat_id=777" in caplog.text
+    assert "user_id=42" in caplog.text
+    assert "text='привет'" in caplog.text
 
 
 def test_commands_include_cmp() -> None:

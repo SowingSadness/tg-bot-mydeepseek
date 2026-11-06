@@ -1,8 +1,13 @@
-"""Inline по номеру сравнения: ``@bot #482913`` → тот же бабл из кеша.
+"""Inline по номеру сравнения: ``@bot #482913`` → фото «A|B», кнопка и бабл.
 
 Inline-режим обязан ответить примерно за 10 секунд, поэтому здесь нет ни сети,
 ни DeepSeek, ни кодирования картинок: только ``SELECT`` из SQLite и
 ``build.render_cached`` (пересборка HTML из уже сжатых WebP за миллисекунды).
+
+Выдача на найденный номер — до трёх результатов в таком порядке:
+фото-композит (если есть ``preview_file_id``), article с url-кнопкой
+«Открыть сравнение» (если задан ``CMP_WEBAPP_SHORT_NAME``) и всегда —
+прежний article с виджетом-шторкой.
 
 Голый ``#`` и номера короче шести цифр — подсказка; всё, что не похоже на
 ``#<6-8 цифр>``, отдаём обычному DeepSeek-пути (``False``).
@@ -10,6 +15,9 @@ Inline-режим обязан ответить примерно за 10 сек�
 
 from __future__ import annotations
 
+import base64
+import hashlib
+import hmac
 import logging
 import re
 
@@ -27,6 +35,83 @@ ID_RE = re.compile(r"^#(\d{6,8})$")
 HINT_RE = re.compile(r"^#\d{0,8}$")
 
 MISSING_DESCRIPTION = "Номер не найден или истёк. Сделайте сравнение в личке с ботом."
+
+
+#: Сколько символов подписи оставляем в ``startapp`` (base64url, без ``=``).
+_START_SIG_LEN = 20
+
+
+def _start_token(cmp_id: str) -> str:
+    """Подпись для ``startapp``: ``<id>_<20 симв. base64url>`` (≤ 64 символов).
+
+    Разделитель — ``_``, а не ``.``: Telegram документирует ``startapp``
+    как base64url (``A-Za-z0-9_-``), точка вне алфавита. Стабильна для
+    одного и того же номера (HMAC от токена бота и номера), поэтому
+    Telegram кеширует мини-апп, а подделать чужой номер нельзя.
+    """
+    sig = (
+        base64.urlsafe_b64encode(
+            hmac.new(
+                settings.telegram_bot_token.encode(), cmp_id.encode(), hashlib.sha256
+            ).digest()
+        )
+        .decode()
+        .rstrip("=")
+    )[:_START_SIG_LEN]
+    return f"{cmp_id}_{sig}"
+
+
+def _photo_result(cached: Cached) -> dict:
+    """``InlineQueryResultCachedPhoto``: композит «A|B» прямо в выдаче.
+
+    Работает только для сравнений, у которых уже есть ``preview_file_id``
+    (его сохраняет `/cmp` после загрузки композита в личку).
+    """
+    first, second = settings.cmp_labels_pair
+    return {
+        "type": "photo",
+        "id": f"{cached.id}-photo",
+        "photo_file_id": cached.preview_file_id,
+        "title": f"Сравнение #{cached.id}",
+        "description": f"{first} / {second}",
+        "caption": f"Сравнение #{cached.id} · {first} / {second}",
+    }
+
+
+def _open_result(cached: Cached) -> dict:
+    """Article с url-кнопкой на мини-апп (``web_app`` в inline запрещён)."""
+    first, second = settings.cmp_labels_pair
+    link = (
+        f"https://t.me/{settings.bot_username}/{settings.cmp_webapp_short_name}"
+        f"?startapp={_start_token(cached.id)}"
+    )
+    return {
+        "type": "article",
+        "id": f"{cached.id}-open",
+        "title": "Открыть сравнение",
+        "description": "Полноразмерное сравнение в мини-приложении",
+        "input_message_content": {
+            "message_text": f"Сравнение #{cached.id} · {first} / {second}",
+        },
+        "reply_markup": {
+            "inline_keyboard": [[{"text": "Открыть сравнение", "url": link}]],
+        },
+    }
+
+
+def _found_results(cached: Cached) -> list[dict]:
+    """Все результаты для найденного сравнения: фото → кнопка → шторка.
+
+    Шторка (виджет) остаётся последней и есть всегда; фото и кнопка —
+    необязательные украшения, без них выдача деградирует до прежней.
+    """
+    results: list[dict] = []
+    if cached.preview_file_id:
+        results.append(_photo_result(cached))
+    if settings.cmp_webapp_short_name and settings.bot_username:
+        results.append(_open_result(cached))
+    results.append(_found_result(cached))
+    return results
 
 
 def _found_result(cached: Cached) -> dict:
@@ -127,10 +212,12 @@ async def try_answer(query) -> bool:
             log.info("inline[%s]: сравнение #%s не найдено (owner=%s)", tag, digits, owner_id)
             return True
 
-        await _answer(api, query, [_found_result(cached)])
+        results = _found_results(cached)
+        await _answer(api, query, results)
         log.info(
-            "inline[%s]: сравнение #%s из кеша (width=%d, quality=%d, zlib=%d)",
+            "inline[%s]: сравнение #%s из кеша (width=%d, quality=%d, zlib=%d, results=%s)",
             tag, cached.id, cached.width, cached.quality, cached.zlib_bytes,
+            [result["id"] for result in results],
         )
         return True
     except api_module.WidgetAPIError as exc:

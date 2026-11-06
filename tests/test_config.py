@@ -36,6 +36,8 @@ EXPECTED_DEFAULTS: dict[str, object] = {
     "cmp_caption": "Сравнение #{id} · {a} / {b}",
     "cmp_title": "Сравнение",
     "cmp_hint": "Проведите ↔",
+    "cmp_webapp_short_name": "",
+    "cmp_preview_width": 2560,
 }
 
 NEW_FIELDS = ("cmp_cache_dir", *EXPECTED_DEFAULTS)
@@ -48,7 +50,7 @@ def _env_example_keys() -> set[str]:
 
 
 def test_all_new_fields_declared() -> None:
-    assert len(NEW_FIELDS) == 21
+    assert len(NEW_FIELDS) == 23
     missing = [name for name in NEW_FIELDS if name not in Settings.model_fields]
     assert not missing, f"в Settings нет полей: {missing}"
 
@@ -65,6 +67,19 @@ def test_cache_dir_default_and_env() -> None:
     assert Settings.model_fields["cmp_cache_dir"].default == Path("var/cmp")
     assert isinstance(settings.cmp_cache_dir, Path)
     assert settings.cmp_cache_dir == Path(os.environ["CMP_CACHE_DIR"])
+
+
+def test_log_level_defaults_to_error(monkeypatch) -> None:
+    """Требование пользователя: в проде тишина, только ERROR."""
+    monkeypatch.delenv("LOG_LEVEL", raising=False)
+    assert Settings.model_fields["log_level"].default == "ERROR"
+    assert _settings().log_level == "ERROR"
+
+
+def test_log_level_env_override(monkeypatch) -> None:
+    """Docker/`.env` переопределяют уровень без изменения кода."""
+    monkeypatch.setenv("LOG_LEVEL", "DEBUG")
+    assert _settings().log_level == "DEBUG"
 
 
 def test_labels_pair() -> None:
@@ -136,6 +151,12 @@ def test_env_example_has_all_new_keys() -> None:
     assert not missing, f"в .env.example нет: {missing}"
     # Переменные альбомного флоу и пропорций бабла документированы явно.
     assert {"CMP_ALBUM_WAIT", "CMP_ASPECT"} <= keys
+
+
+def test_env_example_log_level_is_error() -> None:
+    text = ENV_EXAMPLE.read_text(encoding="utf-8")
+    assert "LOG_LEVEL=ERROR" in text
+    assert "DEBUG" in text  # комментарий о том, как включить отладку
 
 
 def test_env_example_and_settings_keys_match() -> None:

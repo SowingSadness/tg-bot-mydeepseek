@@ -17,6 +17,7 @@ from .compare.store import ComparisonStore
 from .config import settings
 from .deepseek import deepseek
 from .handlers import compare, group, inline, private
+from .logging_setup import describe_update, setup_logging
 from .respond import close_file_session
 
 log = logging.getLogger(__name__)
@@ -56,6 +57,18 @@ def build_dispatcher() -> Dispatcher:
     dispatcher.include_router(compare.router)
     dispatcher.include_router(private.router)
     dispatcher.include_router(group.router)
+
+    @dispatcher.update.outer_middleware()
+    async def _log_update(handler, event, data):  # noqa: ANN001
+        """DEBUG-лог входящего апдейта; на уровне ERROR ничего не пишет."""
+        try:
+            # `describe_update` собирает строку небесплатно (redact/регекспы), поэтому
+            # вызываем его только когда DEBUG реально включён для нашего логгера.
+            if log.isEnabledFor(logging.DEBUG):
+                log.debug("%s", describe_update(event))
+        except Exception:  # noqa: BLE001 — лог не должен ломать обработку
+            log.debug("Не удалось описать входящий апдейт", exc_info=True)
+        return await handler(event, data)
 
     @dispatcher.callback_query()
     async def _answer_any_callback(callback) -> None:  # noqa: ANN001
@@ -144,10 +157,7 @@ async def _set_commands(bot: Bot) -> None:
 
 
 async def main() -> None:
-    logging.basicConfig(
-        level=settings.log_level.upper(),
-        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-    )
+    setup_logging()
 
     bot = Bot(
         token=settings.telegram_bot_token,

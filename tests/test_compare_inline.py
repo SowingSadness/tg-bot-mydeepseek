@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -21,6 +22,11 @@ CMP_ID = "482913"
 QUERY_ID = "query-1"
 IMAGE_A = b"RIFF-a-webp-bytes"
 IMAGE_B = b"RIFF-b-webp-bytes"
+PREVIEW_FILE_ID = "AgACAgIAAxkBAA-preview-file-id"
+SHORT_NAME = "cmp"
+
+#: ``startapp`` = ``<id>_<подпись>``: только base64url (``A-Za-z0-9_-``).
+START_TOKEN_RE = re.compile(r"[0-9]+_[A-Za-z0-9_-]{16,}")
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -28,7 +34,12 @@ ROOT = Path(__file__).resolve().parents[1]
 # --------------------------------------------------------------------- helpers
 
 
-def cached(cmp_id: str = CMP_ID, owner_id: int = USER_ID) -> Cached:
+def cached(
+    cmp_id: str = CMP_ID,
+    owner_id: int = USER_ID,
+    *,
+    preview_file_id: str | None = None,
+) -> Cached:
     """Сравнение, как его отдаёт `ComparisonStore.get`."""
     return Cached(
         id=cmp_id,
@@ -40,6 +51,7 @@ def cached(cmp_id: str = CMP_ID, owner_id: int = USER_ID) -> Cached:
         zlib_bytes=1024,
         image_a=IMAGE_A,
         image_b=IMAGE_B,
+        preview_file_id=preview_file_id,
     )
 
 
@@ -105,10 +117,11 @@ def configure(store: FakeStore | None = None, api: FakeAPI | None = None) -> Non
 
 @pytest.fixture(autouse=True)
 def _clean_singletons(monkeypatch: pytest.MonkeyPatch):
-    """Синглтоны и режим доступа не протекают между тестами."""
+    """Синглтоны, режим доступа и мини-апп не протекают между тестами."""
     monkeypatch.setattr(service, "_store", None)
     monkeypatch.setattr(api_module, "_api", None)
     monkeypatch.setattr(settings, "cmp_share_by_id", False)
+    monkeypatch.setattr(settings, "cmp_webapp_short_name", "")
     yield
 
 
@@ -117,6 +130,11 @@ def _article(api: FakeAPI) -> dict:
     results = api.calls[0]["results"]
     assert len(results) == 1
     return results[0]
+
+
+def _results(api: FakeAPI) -> list[dict]:
+    assert len(api.calls) == 1
+    return api.calls[0]["results"]
 
 
 # ---------------------------------------------------------------------- ID_RE
@@ -132,6 +150,120 @@ def test_id_re_accepts_numbers(text: str):
 )
 def test_id_re_rejects_everything_else(text: str):
     assert compare_inline.ID_RE.fullmatch(text) is None
+
+
+# ------------------------------------------------------- multi-result payload
+
+
+async def test_found_comparison_returns_photo_open_and_widget(monkeypatch: pytest.MonkeyPatch):
+    """Порядок выдачи: фото-превью → кнопка мини-аппа → шторка."""
+    monkeypatch.setattr(settings, "cmp_webapp_short_name", SHORT_NAME)
+    store = FakeStore(cached(preview_file_id=PREVIEW_FILE_ID))
+    api = FakeAPI()
+    configure(store, api)
+
+    assert await compare_inline.try_answer(make_query(f"#{CMP_ID}")) is True
+
+    call = api.calls[0]
+    assert call["cache_time"] == 0
+    assert call["is_personal"] is True
+
+    results = _results(api)
+    assert [result["type"] for result in results] == ["photo", "article", "article"]
+    assert [result["id"] for result in results] == [
+        f"{CMP_ID}-photo",
+        f"{CMP_ID}-open",
+        CMP_ID,
+    ]
+
+    first, second = settings.cmp_labels_pair
+
+    photo = results[0]
+    assert photo["photo_file_id"] == PREVIEW_FILE_ID
+    assert photo["title"] == f"Сравнение #{CMP_ID}"
+    assert photo["description"] == f"{first} / {second}"
+    assert photo["caption"] == f"Сравнение #{CMP_ID} · {first} / {second}"
+
+    open_result = results[1]
+    assert open_result["title"] == "Открыть сравнение"
+    assert open_result["description"] == "Полноразмерное сравнение в мини-приложении"
+    assert open_result["input_message_content"] == {
+        "message_text": f"Сравнение #{CMP_ID} · {first} / {second}",
+    }
+    button = open_result["reply_markup"]["inline_keyboard"][0][0]
+    assert button["text"] == "Открыть сравнение"
+    prefix = f"https://t.me/{settings.bot_username}/{SHORT_NAME}?startapp="
+    assert button["url"].startswith(prefix)
+    token = button["url"][len(prefix):]
+    assert START_TOKEN_RE.fullmatch(token) is not None
+    assert token.startswith(f"{CMP_ID}_")
+    assert len(token) <= 64
+    # Без экранированной/литеральной точки: Telegram ждёт base64url.
+    assert "%2E" not in button["url"] and "." not in token
+
+    # Последним всегда идёт прежний article со шторкой (html-виджет).
+    widget = results[2]
+    assert "html" in widget["input_message_content"]
+    assert widget["input_message_content"]["width"] == 0
+
+
+@pytest.mark.parametrize("preview_file_id", [None, ""])
+async def test_photo_result_absent_without_preview_file_id(
+    preview_file_id: str | None,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setattr(settings, "cmp_webapp_short_name", SHORT_NAME)
+    store = FakeStore(cached(preview_file_id=preview_file_id))
+    api = FakeAPI()
+    configure(store, api)
+
+    assert await compare_inline.try_answer(make_query(f"#{CMP_ID}")) is True
+
+    results = _results(api)
+    assert [result["id"] for result in results] == [f"{CMP_ID}-open", CMP_ID]
+    assert all("photo_file_id" not in result for result in results)
+
+
+async def test_open_result_absent_without_short_name():
+    store = FakeStore(cached(preview_file_id=PREVIEW_FILE_ID))
+    api = FakeAPI()
+    configure(store, api)
+
+    assert await compare_inline.try_answer(make_query(f"#{CMP_ID}")) is True
+
+    results = _results(api)
+    assert [result["id"] for result in results] == [f"{CMP_ID}-photo", CMP_ID]
+    assert all("reply_markup" not in result for result in results)
+
+
+async def test_without_preview_and_short_name_only_widget_remains():
+    store = FakeStore(cached())
+    api = FakeAPI()
+    configure(store, api)
+
+    assert await compare_inline.try_answer(make_query(f"#{CMP_ID}")) is True
+
+    results = _results(api)
+    assert [result["id"] for result in results] == [CMP_ID]
+    assert results[0]["type"] == "article"
+    assert "html" in results[0]["input_message_content"]
+
+
+def test_start_token_is_short_base64url_and_stable():
+    token = compare_inline._start_token(CMP_ID)
+
+    # ``re.fullmatch(r'[0-9]+_[A-Za-z0-9_-]{16,}', token)`` — только base64url.
+    assert START_TOKEN_RE.fullmatch(token) is not None
+    assert re.fullmatch(r"[0-9]+_[A-Za-z0-9_-]{16,}", token) is not None
+    assert re.fullmatch(r"[A-Za-z0-9_-]+", token) is not None
+    assert token.split("_", 1)[0] == CMP_ID
+    assert len(token.split("_", 1)[1]) >= 16
+    assert len(token) <= 64
+    # Один и тот же номер — одна и та же подпись (Telegram кеширует мини-апп).
+    assert compare_inline._start_token(CMP_ID) == token
+    # Разные номера подписаны по-разному.
+    other = compare_inline._start_token("999999")
+    assert other.split("_", 1)[1] != token.split("_", 1)[1]
 
 
 # ------------------------------------------------------------- found / missing
@@ -185,6 +317,22 @@ async def test_foreign_comparison_without_share_is_missing():
     assert article["title"] == f"Сравнение #{CMP_ID} не найдено"
     assert "Номер не найден" in article["description"]
     assert api.calls[0]["is_personal"] is True
+
+
+async def test_foreign_number_without_share_never_leaks_photo(monkeypatch: pytest.MonkeyPatch):
+    """Чужое сравнение с превью не должно отдавать file_id при CMP_SHARE_BY_ID=false."""
+    monkeypatch.setattr(settings, "cmp_webapp_short_name", SHORT_NAME)
+    store = FakeStore(cached(owner_id=OTHER_USER_ID, preview_file_id=PREVIEW_FILE_ID))
+    api = FakeAPI()
+    configure(store, api)
+
+    assert await compare_inline.try_answer(make_query(f"#{CMP_ID}")) is True
+
+    assert store.calls == [(CMP_ID, USER_ID)]
+    results = _results(api)
+    assert [result["id"] for result in results] == ["cmp-missing"]
+    assert all("photo_file_id" not in result for result in results)
+    assert all("reply_markup" not in result for result in results)
 
 
 async def test_share_by_id_finds_foreign_comparison(monkeypatch: pytest.MonkeyPatch):
@@ -257,6 +405,28 @@ async def test_widget_api_error_is_swallowed():
     configure(FakeStore(cached()), api)
 
     assert await compare_inline.try_answer(make_query(f"#{CMP_ID}")) is True
+
+
+async def test_widget_api_error_does_not_break_multi_result_answer(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setattr(settings, "cmp_webapp_short_name", SHORT_NAME)
+    api = FakeAPI(error=WidgetAPIError(400, "QUERY_ID_INVALID"))
+    configure(FakeStore(cached(preview_file_id=PREVIEW_FILE_ID)), api)
+
+    # Протухший query ID — не повод уходить в DeepSeek и не повод падать.
+    assert await compare_inline.try_answer(make_query(f"#{CMP_ID}")) is True
+    assert [result["id"] for result in _results(api)] == [
+        f"{CMP_ID}-photo",
+        f"{CMP_ID}-open",
+        CMP_ID,
+    ]
+
+
+async def test_widget_api_error_on_unknown_number_still_answers_missing_hint():
+    api = FakeAPI(error=WidgetAPIError(400, "QUERY_ID_INVALID"))
+    configure(FakeStore(), api)
+
+    assert await compare_inline.try_answer(make_query("#999999")) is True
+    assert _article(api)["id"] == "cmp-missing"
 
 
 async def test_without_configure_returns_false():

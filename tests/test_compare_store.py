@@ -106,6 +106,65 @@ async def test_get_unknown_id_returns_none(store: ComparisonStore):
     assert await store.get("000000", owner_id=7) is None
 
 
+async def test_preview_file_id_defaults_to_none_and_round_trips(store: ComparisonStore):
+    """`preview_file_id` — необязательное украшение: без него NULL, с ним — сохраняется."""
+    plain_id = await _save(store)
+    plain = await store.get(plain_id)
+    assert plain is not None and plain.preview_file_id is None
+
+    with_preview = await store.save(
+        7,
+        image_a=IMAGE_A,
+        image_b=IMAGE_B,
+        width=430,
+        quality=34,
+        labels=LABELS,
+        zlib_bytes=1024,
+        preview_file_id="AgACAgIAAxkBAAI",
+    )
+    cached = await store.get(with_preview)
+
+    assert cached is not None
+    assert cached.preview_file_id == "AgACAgIAAxkBAAI"
+
+
+async def test_set_preview_file_id_updates_existing_record(store: ComparisonStore):
+    cmp_id = await _save(store)
+
+    await store.set_preview_file_id(cmp_id, "file-id-after-upload")
+    cached = await store.get(cmp_id)
+
+    assert cached is not None
+    assert cached.preview_file_id == "file-id-after-upload"
+
+
+async def test_set_preview_file_id_survives_reopen(tmp_path: Path):
+    path = tmp_path / "cmp.db"
+    first = ComparisonStore(path)
+    try:
+        cmp_id = await _save(first)
+        await first.set_preview_file_id(cmp_id, "persisted-file-id")
+    finally:
+        await first.close()
+
+    second = ComparisonStore(path)
+    try:
+        cached = await second.get(cmp_id)
+    finally:
+        await second.close()
+
+    assert cached is not None
+    assert cached.preview_file_id == "persisted-file-id"
+
+
+async def test_set_preview_file_id_for_unknown_id_is_noop(store: ComparisonStore):
+    """Номер уже вычищен purge-ем — превью просто некуда писать, но и падать незачем."""
+    await store.set_preview_file_id("000000", "orphan-file-id")
+
+    assert await store.count() == 0
+    assert await store.get("000000") is None
+
+
 async def test_purge_zero_ttl_removes_everything(store: ComparisonStore):
     for index in range(3):
         await _save(store, now=100.0 + index)
@@ -230,6 +289,58 @@ async def test_migrates_old_database_without_aspect(tmp_path: Path):
         legacy_id = await _save(store, aspect="4:3")
         legacy = await store.get(legacy_id)
         assert legacy is not None and legacy.aspect == "4:3"
+    finally:
+        await store.close()
+
+
+async def test_migrates_old_database_without_preview_file_id(tmp_path: Path):
+    """Старая БД без `preview_file_id`: ALTER TABLE, старые строки читаются с NULL."""
+    path = tmp_path / "old-preview.db"
+    conn = sqlite3.connect(str(path))
+    try:
+        conn.executescript(
+            """
+            CREATE TABLE comparisons (
+              id TEXT PRIMARY KEY, owner_id INTEGER NOT NULL, created_at REAL NOT NULL,
+              width INTEGER NOT NULL, quality INTEGER NOT NULL, labels TEXT NOT NULL,
+              zlib_bytes INTEGER NOT NULL, image_a BLOB NOT NULL, image_b BLOB NOT NULL,
+              aspect TEXT NOT NULL DEFAULT '3:2'
+            );
+            """
+        )
+        conn.execute(
+            "INSERT INTO comparisons VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            ("482913", 7, 100.0, 430, 34, "До|После", 1024, IMAGE_A, IMAGE_B, "3:2"),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    store = ComparisonStore(path)
+    try:
+        cached = await store.get("482913")
+        assert cached is not None
+        # Старые записи превью не имеют — inline просто не покажет фото.
+        assert cached.preview_file_id is None
+        assert cached.image_a == IMAGE_A
+
+        # Миграция не мешает ни UPDATE старой строки, ни новым вставкам с file_id.
+        await store.set_preview_file_id("482913", "legacy-then-uploaded")
+        again = await store.get("482913")
+        assert again is not None and again.preview_file_id == "legacy-then-uploaded"
+
+        fresh_id = await store.save(
+            7,
+            image_a=IMAGE_A,
+            image_b=IMAGE_B,
+            width=430,
+            quality=34,
+            labels=LABELS,
+            zlib_bytes=1024,
+            preview_file_id="fresh-file-id",
+        )
+        fresh = await store.get(fresh_id)
+        assert fresh is not None and fresh.preview_file_id == "fresh-file-id"
     finally:
         await store.close()
 

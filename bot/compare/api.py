@@ -10,9 +10,14 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from typing import Any, Awaitable, Callable
 
 import aiohttp
+
+from ..logging_setup import describe_api_call, describe_api_response, redact
+
+log = logging.getLogger(__name__)
 
 # Сколько раз повторяем запрос, если сервер вернул `parameters.retry_after`.
 MAX_RETRIES = 2
@@ -150,17 +155,39 @@ class WidgetAPI:
         raise WidgetAPIError(code, description, retry_after=retry_after)
 
     async def call(self, method: str, **params: Any) -> Any:
-        """Вызов метода: POST JSON, разбор ответа, `retry_after` ≤ `MAX_RETRIES` повторов."""
+        """Вызов метода: POST JSON, разбор ответа, `retry_after` ≤ `MAX_RETRIES` повторов.
+
+        На DEBUG логируются вызов и ответ (без html/base64/токена), на WARNING —
+        `retry_after`-паузы, на ERROR — финальная ошибка Bot API.
+        """
         url = self.url(method)
         retries = 0
         while True:
-            status, payload = await self._post(url, params)
+            log.debug("%s", describe_api_call(method, params, token=self.token))
             try:
+                status, payload = await self._post(url, params)
+                log.debug(
+                    "%s",
+                    describe_api_response(method, status, payload, token=self.token),
+                )
                 return self._parse(method, status, payload)
             except WidgetAPIError as exc:
                 if exc.retry_after is None or retries >= MAX_RETRIES:
+                    log.error(
+                        "Bot API %s: код %s, %s",
+                        method,
+                        "без кода" if exc.code is None else exc.code,
+                        redact(exc.description, token=self.token),
+                    )
                     raise
                 retries += 1
+                log.warning(
+                    "Bot API %s: retry_after=%g, повтор %d/%d",
+                    method,
+                    exc.retry_after,
+                    retries,
+                    MAX_RETRIES,
+                )
                 # Через модуль, а не `from asyncio import sleep`: тесты подменяют сон.
                 await asyncio.sleep(exc.retry_after)
 

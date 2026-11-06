@@ -25,7 +25,8 @@ class Settings(BaseSettings):
     deepseek_base_url: str = "https://api.deepseek.com"
     deepseek_model: str = "deepseek-flash"
     request_timeout: float = 180.0
-    log_level: str = "INFO"
+    # DEBUG — логи Telegram API и входящих сообщений; в проде ERROR (по умолчанию).
+    log_level: str = "ERROR"
 
     # Лимит длины ответов в личке/группах. 0 = без ограничения.
     chat_max_tokens: int = 0
@@ -74,6 +75,11 @@ class Settings(BaseSettings):
     cmp_caption: str = "Сравнение #{id} · {a} / {b}"
     cmp_title: str = "Сравнение"
     cmp_hint: str = "Проведите ↔"
+    # Short name мини-аппа из BotFather для кнопки «Открыть сравнение».
+    # Пусто = кнопка не добавляется (мини-апп ещё не настроен).
+    cmp_webapp_short_name: str = ""
+    # Ширина композита-превью «A|B» в пикселях (Telegram ужмёт по длинной стороне).
+    cmp_preview_width: int = 2560
 
     @field_validator("cmp_labels")
     @classmethod

@@ -54,6 +54,35 @@ class FakeUser:
         self.id = user_id
 
 
+class FakeBot:
+    """Двойник `Message.bot` с двумя нужными методами и возможностью падать."""
+
+    def __init__(self, calls: list, *, send_error=None, delete_error=None) -> None:
+        self.calls = calls
+        self.send_error = send_error
+        self.delete_error = delete_error
+        self.sent: list = []
+
+    async def send_photo(self, chat_id: int, photo, **kwargs):
+        self.calls.append(("bot.send_photo", chat_id, photo, kwargs))
+        if self.send_error is not None:
+            raise self.send_error
+        sent = SimpleNamespace(
+            message_id=900 + len(self.sent),
+            photo=[
+                SimpleNamespace(file_id="preview-file-small", width=320),
+                SimpleNamespace(file_id=f"preview-file-{len(self.sent) + 1}", width=2560),
+            ],
+        )
+        self.sent.append(sent)
+        return sent
+
+    async def delete_message(self, chat_id: int, message_id: int) -> None:
+        self.calls.append(("bot.delete_message", chat_id, message_id))
+        if self.delete_error is not None:
+            raise self.delete_error
+
+
 class FakeMessage:
     """Минимальный двойник `aiogram.types.Message` со записью вызовов."""
 
@@ -69,6 +98,7 @@ class FakeMessage:
         reply_to_message=None,
         media_group_id: str | None = None,
         message_id: int = 1,
+        bot: FakeBot | None = None,
     ) -> None:
         self.calls = calls
         self.chat = FakeChat()
@@ -80,7 +110,7 @@ class FakeMessage:
         self.reply_to_message = reply_to_message
         self.media_group_id = media_group_id
         self.message_id = message_id
-        self.bot = None
+        self.bot = bot if bot is not None else FakeBot(calls)
         self.answers: list[str] = []
         self.media_groups: list = []
 
@@ -131,6 +161,9 @@ class FakeStore:
     async def save(self, owner_id: int, **kwargs) -> str:
         self.calls.append(("store.save", owner_id, kwargs))
         return self.cmp_id
+
+    async def set_preview_file_id(self, cmp_id: str, file_id: str) -> None:
+        self.calls.append(("store.set_preview_file_id", cmp_id, file_id))
 
     async def get(self, cmp_id: str, *, owner_id: int | None = None):
         return None
@@ -207,6 +240,10 @@ def _widgets(calls: list) -> list:
 
 def _answers(calls: list) -> list[str]:
     return [call[1] for call in calls if call[0] in ("answer", "reply")]
+
+
+def _by_name(calls: list, name: str) -> list:
+    return [call for call in calls if call[0] == name]
 
 
 # --------------------------------------------------------------------- album
@@ -592,6 +629,78 @@ async def test_widget_too_large_reports_text_and_saves_nothing(env, monkeypatch)
     assert message.answers == [service.TOO_LARGE_TEXT]
     assert not _saves(env.calls)
     assert not _widgets(env.calls)
+
+
+async def test_preview_is_uploaded_deleted_and_file_id_saved_last(env):
+    """Успешный путь: композит уходит невидимо, сообщение удаляется, file_id — в кеш."""
+    message = FakeMessage(env.calls)
+    await service.compare_images(message, PNG_A, PNG_B)
+
+    sends = _by_name(env.calls, "bot.send_photo")
+    assert len(sends) == 1
+    _, chat_id, upload, kwargs = sends[0]
+    assert chat_id == CHAT_ID
+    assert upload.filename == "cmp-preview.jpg"
+    assert upload.data[:2] == b"\xff\xd8"  # настоящий JPEG-композит
+    assert kwargs == {"disable_notification": True}
+
+    deletes = _by_name(env.calls, "bot.delete_message")
+    assert deletes == [("bot.delete_message", CHAT_ID, message.bot.sent[0].message_id)]
+
+    names = _names(env.calls)
+    assert (
+        names.index("api.send_widget")
+        < names.index("bot.send_photo")
+        < names.index("bot.delete_message")
+        < names.index("store.set_preview_file_id")
+    )
+    # file_id берётся из последнего (самого большого) размера фото и только после удаления.
+    assert _by_name(env.calls, "store.set_preview_file_id") == [
+        ("store.set_preview_file_id", CMP_ID, "preview-file-1")
+    ]
+    assert any(f"#{CMP_ID}" in answer for answer in message.answers)
+
+
+async def test_preview_send_failure_warns_and_keeps_widget_and_hint(env, caplog):
+    """send_photo упал: предупреждение в лог, file_id нет — но бабл и подсказка ушли."""
+    message = FakeMessage(env.calls)
+    message.bot.send_error = RuntimeError("network down")
+
+    with caplog.at_level(logging.WARNING, logger=service.log.name):
+        await service.compare_images(message, PNG_A, PNG_B)
+
+    assert "превью" in caplog.text and "network down" in caplog.text
+    assert len(_widgets(env.calls)) == 1
+    assert any(f"#{CMP_ID}" in answer for answer in message.answers)
+    assert not _by_name(env.calls, "store.set_preview_file_id")
+    assert not _by_name(env.calls, "bot.delete_message")
+
+
+async def test_preview_delete_failure_warns_and_does_not_save_file_id(env, caplog):
+    """delete_message упал: сообщение осталось, file_id не кешируем, /cmp не ломается."""
+    message = FakeMessage(env.calls)
+    message.bot.delete_error = RuntimeError("message to delete not found")
+
+    with caplog.at_level(logging.WARNING, logger=service.log.name):
+        await service.compare_images(message, PNG_A, PNG_B)
+
+    assert "превью" in caplog.text and "delete" in caplog.text.lower()
+    assert len(_widgets(env.calls)) == 1
+    assert any(f"#{CMP_ID}" in answer for answer in message.answers)
+    assert not _by_name(env.calls, "store.set_preview_file_id")
+
+
+async def test_preview_is_uploaded_after_widget_fallback(env):
+    """Фолбэк-альбом вместо виджета не отменяет превью: file_id всё равно кешируется."""
+    env.api.error = WidgetAPIError(400, "INPUT_MEDIA_WIDGET_NOT_ALLOWED")
+    message = FakeMessage(env.calls)
+    await service.compare_images(message, PNG_A, PNG_B)
+
+    assert len(message.media_groups) == 1
+    assert len(_by_name(env.calls, "bot.send_photo")) == 1
+    assert _by_name(env.calls, "store.set_preview_file_id") == [
+        ("store.set_preview_file_id", CMP_ID, "preview-file-1")
+    ]
 
 
 async def test_not_an_image_reports_text_and_saves_nothing(env):
