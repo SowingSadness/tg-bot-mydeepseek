@@ -161,6 +161,8 @@ async def test_own_comparison_returns_one_widget_article():
         labels=settings.cmp_labels_pair,
         title=settings.cmp_title,
         hint=settings.cmp_hint,
+        # Inline-ветка передаёт ширину из кеша: у слоёв есть запечённые width/height.
+        width=cached().width,
     )
     assert article["input_message_content"] == {
         "html": expected_html,

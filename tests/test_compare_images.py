@@ -180,6 +180,25 @@ def test_to_webp_size_is_exactly_3_2():
         assert url == webp_data_url(blob)
 
 
+def test_to_webp_height_equals_build_size_attribute():
+    """Запечённая высота и `height`-атрибут слоя — одна и та же формула."""
+    from bot.compare.build import _aspect_pair, _height_for
+
+    img = Image.new("RGB", (900, 700), "white")
+    for aspect in ("3:2", "4:3", "16:9", "2.66:1"):
+        pair = _aspect_pair(aspect)
+        for width in (203, 300):
+            _, blob, _ = to_webp(img, width, 30, aspect=pair)
+            assert _decode_webp(blob).size == (width, _height_for(width, aspect)), aspect
+
+
+def test_to_webp_accepts_fractional_aspect_pair():
+    """`2.66:1` из `bot.config` приходит уже целой парой `(133, 50)`."""
+    _, blob, _ = to_webp(Image.new("RGB", (900, 700), "white"), 266, 30, aspect=(133, 50))
+
+    assert _decode_webp(blob).size == (266, 100)
+
+
 def test_to_webp_returns_data_url_and_webp_bytes():
     url, blob, error = to_webp(Image.new("RGB", (800, 600), "teal"), 200, 34)
 

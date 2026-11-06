@@ -7,6 +7,7 @@ import re
 import shutil
 import tempfile
 import zlib
+from io import BytesIO
 from pathlib import Path
 
 import pytest
@@ -19,6 +20,8 @@ from bot.compare.build import (
     Attempt,
     Built,
     WidgetTooLarge,
+    _aspect_pair,
+    _height_for,
     _qualities,
     _widths,
     build,
@@ -28,7 +31,7 @@ from bot.compare.build import (
     render_cached,
     zsize,
 )
-from bot.compare.images import PROFILES, fit_box, to_webp
+from bot.compare.images import PROFILES, ImageError, fit_box, to_webp
 
 LABELS = ("До", "После")
 TITLE = "Сравнение"
@@ -64,6 +67,20 @@ def _noise(size: tuple[int, int] = (400, 300)) -> Image.Image:
     return Image.frombytes("RGB", size, os.urandom(size[0] * size[1] * 3))
 
 
+def _layer_sizes(html: str) -> list[tuple[int, int]]:
+    """Пары `width`/`height` атрибутов обеих картинок в порядке появления в HTML."""
+    return [
+        (int(width), int(height))
+        for width, height in re.findall(r'<img [^>]*width="(\d+)" height="(\d+)"', html)
+    ]
+
+
+def _webp_size(blob: bytes) -> tuple[int, int]:
+    """Реальный размер запечённого WebP: с ним обязаны совпадать атрибуты слоёв."""
+    with Image.open(BytesIO(blob)) as decoded:
+        return decoded.size
+
+
 # --------------------------------------------------------------------------- render
 
 
@@ -82,6 +99,49 @@ def test_render_fills_every_placeholder():
 def test_render_uses_custom_aspect():
     html = render("a", "b", labels=LABELS, title=TITLE, hint=HINT, aspect="4:3")
     assert "aspect-ratio: 4 / 3" in html
+
+
+def test_render_bakes_layer_size_attributes():
+    html = render("a", "b", labels=LABELS, title=TITLE, hint=HINT, aspect="4:3", width=300)
+
+    sizes = _layer_sizes(html)
+    assert sizes == [(300, 225), (300, 225)]
+    assert "{{SIZE}}" not in html
+    assert 'src="a" width="300" height="225"' in html
+    assert 'src="b" width="300" height="225"' in html
+
+
+def test_render_without_width_has_no_size_attributes():
+    html = render("a", "b", labels=LABELS, title=TITLE, hint=HINT)
+
+    assert "{{SIZE}}" not in html
+    assert 'width="' not in html and 'height="' not in html
+
+
+def test_render_height_matches_webp_size_for_every_aspect():
+    """Атрибуты и запечённый WebP считаются одной формулой — иначе слои разъедутся."""
+    img = _blue()
+    for aspect in ("3:2", "4:3", "16:9"):
+        _, blob, _ = to_webp(img, 203, 30, aspect=tuple(_aspect_pair(aspect)))
+        html = render("a", "b", labels=LABELS, title=TITLE, hint=HINT, aspect=aspect, width=203)
+
+        expected = _webp_size(blob)
+        assert _layer_sizes(html) == [expected, expected], aspect
+        assert expected[0] == 203
+        assert expected[1] == _height_for(203, aspect)
+
+
+def test_aspect_pair_accepts_integers_and_fractions():
+    assert _aspect_pair("3:2") == (3, 2)
+    assert _aspect_pair("4:3") == (4, 3)
+    assert _aspect_pair("16:9") == (16, 9)
+    assert _aspect_pair("2.66:1") == (133, 50)
+    assert _aspect_pair((3, 2)) == (3, 2)
+
+    with pytest.raises(ImageError):
+        _aspect_pair("32")
+    with pytest.raises(ImageError):
+        _aspect_pair((0, 2))
 
 
 def test_render_keeps_css_braces():
@@ -121,6 +181,19 @@ def test_render_cached_defaults_to_3_2_and_honours_aspect():
     assert "aspect-ratio: 4 / 3" in render_cached(**base, aspect="4:3")
 
 
+def test_render_cached_bakes_size_only_when_width_given():
+    _, blob_a, _ = to_webp(_blue(), 150, 30)
+    _, blob_b, _ = to_webp(_orange(), 150, 30)
+    base = dict(image_a=blob_a, image_b=blob_b, labels=LABELS, title=TITLE, hint=HINT)
+
+    assert _layer_sizes(render_cached(**base)) == []
+    assert _layer_sizes(render_cached(**base, width=150)) == [(150, 100), (150, 100)]
+    assert _layer_sizes(render_cached(**base, aspect="16:9", width=150)) == [
+        (150, 84),
+        (150, 84),
+    ]
+
+
 def test_zsize_matches_zlib_level_9():
     html = render("a", "b", labels=LABELS, title=TITLE, hint=HINT)
     assert zsize(html) == len(zlib.compress(html.encode("utf-8"), 9))
@@ -150,12 +223,29 @@ def test_template_keeps_clip_anchored_to_left_edge():
     assert "inset" not in clip
     assert "calc(var(--p)*1%)" in clip
 
-    # Картинка внутри клипа: ширина из собственных пропорций, без object-fit.
-    for declaration in ("left:0", "top:0", "height:100%", "width:auto", "max-width:none"):
+    # Картинка внутри клипа: размеры задаются атрибутами и JS в px, не из пропорций.
+    for declaration in ("left:0", "top:0", "height:100%", "max-width:none"):
         assert declaration in image
+    assert "width:auto" not in image
     assert "object-fit" not in image
     assert "right:" not in image
     assert "inset" not in image
+
+
+def test_template_bakes_size_and_syncs_layers_from_js():
+    """Слои получают запечённые атрибуты и px-размеры из `#c`, а не из `width:auto`."""
+    template = _template_text()
+
+    assert template.count("{{SIZE}}") == 2
+    assert '<img id=ib src="{{B}}" {{SIZE}}>' in template
+    assert '<div id=k><img id=ia src="{{A}}" {{SIZE}}></div>' in template
+
+    # Размер обновляется после layout’а, в кадре анимации и на каждом касании.
+    assert "function sz(){var b=c.getBoundingClientRect()" in template
+    assert "ib.style.width=ia.style.width=b.width+'px'" in template
+    assert "ib.style.height=ia.style.height=b.height+'px'" in template
+    assert "f();sz();requestAnimationFrame(sz);" in template
+    assert "if(!(b.width>0))return;\nsz();" in template
 
 
 def test_template_storage_access_is_guarded_by_try():
@@ -220,8 +310,11 @@ def test_template_position_variable_is_percent():
 
 
 def test_template_fits_minified_budget():
-    """Шаблон сам по себе должен занимать < 1000 Б zlib из бюджета виджета."""
-    assert zsize(_template_text()) <= 1000
+    """Шаблон сам по себе должен занимать < 1100 Б zlib из бюджета виджета.
+
+    Было 994 Б до явных px-размеров слоёв; `sz()` и `{{SIZE}}` добавили ~80 Б.
+    """
+    assert zsize(_template_text()) <= 1100
 
 
 # --------------------------------------------------------------------------- build
@@ -250,9 +343,35 @@ def test_build_demo_pair_fits_limits():
         title=TITLE,
         hint=HINT,
         aspect=built.aspect,
+        width=built.width,
     )
     assert "aspect-ratio: 3 / 2" in built.html
+    assert "{{SIZE}}" not in built.html
     assert "{{" not in built.html
+
+    # Запечённые атрибуты обеих картинок совпадают с реальным размером WebP.
+    sizes = _layer_sizes(built.html)
+    assert sizes == [_webp_size(built.image_a), _webp_size(built.image_b)]
+    assert sizes == [(built.width, _height_for(built.width, built.aspect))] * 2
+
+
+def test_build_honours_aspect_in_size_attributes():
+    img_a, img_b = demo_pair()
+    built = build(
+        img_a,
+        img_b,
+        start_width=200,
+        min_width=160,
+        labels=LABELS,
+        title=TITLE,
+        hint=HINT,
+        aspect=(4, 3),
+    )
+
+    assert built.aspect == "4:3"
+    sizes = _layer_sizes(built.html)
+    assert sizes == [_webp_size(built.image_a), _webp_size(built.image_b)]
+    assert sizes == [(built.width, _height_for(built.width, "4:3"))] * 2
 
 
 def test_build_uses_one_crop_box_for_both_images(monkeypatch):

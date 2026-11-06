@@ -39,6 +39,7 @@ def _found_result(cached: Cached) -> dict:
         hint=settings.cmp_hint,
         # Старые номера пересобираются в своих пропорциях, а не в текущих по умолчанию.
         aspect=cached.aspect,
+        width=cached.width,
     )
     first, second = settings.cmp_labels_pair
     return {

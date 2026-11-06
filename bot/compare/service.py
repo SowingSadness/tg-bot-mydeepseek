@@ -363,6 +363,7 @@ async def compare_images(message, a: bytes, b: bytes) -> None:
         title=settings.cmp_title,
         hint=settings.cmp_hint,
         aspect=built.aspect,
+        width=built.width,
     )
 
     api = api_module.get_api()

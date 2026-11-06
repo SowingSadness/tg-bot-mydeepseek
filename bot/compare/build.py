@@ -19,6 +19,7 @@ import sys
 import time
 import zlib
 from dataclasses import dataclass
+from fractions import Fraction
 from pathlib import Path
 
 from PIL import Image, ImageDraw, ImageFilter, ImageOps
@@ -108,6 +109,51 @@ def _aspect_css(aspect: str) -> str:
     return str(aspect).strip().replace(":", " / ")
 
 
+def _aspect_pair(aspect) -> tuple[int, int]:
+    """`'3:2'`, `'2.66:1'` или `(3, 2)` → целая пара положительных чисел.
+
+    Дробные пропорции сводятся к целым так же, как в `bot.config` (`2.66:1` → `133:50`):
+    по этой паре считается и высота запечённого WebP (`images.to_webp`), и `height`
+    в разметке, поэтому слои не могут разъехаться по масштабу.
+    """
+    if isinstance(aspect, str):
+        left, sep, right = aspect.strip().partition(":")
+        if not sep:
+            raise ImageError(f"Непонятные пропорции: {aspect}.")
+        parts = (left, right)
+    else:
+        try:
+            parts = tuple(aspect)
+        except TypeError as exc:
+            raise ImageError(f"Непонятные пропорции: {aspect}.") from exc
+        if len(parts) != 2:
+            raise ImageError(f"Непонятные пропорции: {aspect}.")
+    try:
+        left_frac, right_frac = (Fraction(str(part)) for part in parts)
+    except (ValueError, ZeroDivisionError) as exc:
+        raise ImageError(f"Непонятные пропорции: {aspect}.") from exc
+    if left_frac <= 0 or right_frac <= 0:
+        raise ImageError("Пропорции картинки заданы неверно.")
+    ratio = (left_frac / right_frac).limit_denominator(1000)
+    return ratio.numerator, ratio.denominator
+
+
+def _height_for(width: int, aspect="3:2") -> int:
+    """Высота слоя в px — та же формула, что у запечённого WebP в `images.to_webp`."""
+    aw, ah = _aspect_pair(aspect)
+    return max(1, round(int(width) * ah / aw))
+
+
+def _size_attrs(width: int | None, aspect: str) -> str:
+    """`width`/`height` атрибуты обеих картинок: до первого кадра слой уже в своём размере."""
+    if width is None:
+        return ""
+    width = int(width)
+    if width <= 0:
+        return ""
+    return f'width="{width}" height="{_height_for(width, aspect)}"'
+
+
 def render(
     a_url: str,
     b_url: str,
@@ -116,8 +162,12 @@ def render(
     title: str,
     hint: str,
     aspect: str = "3:2",
+    width: int | None = None,
 ) -> str:
     """Подставляет значения в шаблон.
+
+    `width` — ширина запечённого WebP: если задана, обе `<img>` получают пару
+    `width`/`height` в пикселях, чтобы движок клиента не выводил ширину сам.
 
     Только `str.replace`: в CSS шаблона есть фигурные скобки, `str.format` его сломает.
     """
@@ -125,6 +175,7 @@ def render(
     replacements = (
         ("{{TITLE}}", _escape(title)),
         ("{{AR}}", _aspect_css(aspect)),
+        ("{{SIZE}}", _size_attrs(width, aspect)),
         ("{{LABEL_A}}", _escape(label_a)),
         ("{{LABEL_B}}", _escape(label_b)),
         ("{{HINT}}", _escape(hint)),
@@ -145,8 +196,13 @@ def render_cached(
     title: str,
     hint: str,
     aspect: str = "3:2",
+    width: int | None = None,
 ) -> str:
-    """Пересобирает HTML из закешированных картинок — быстро, без сети и кодирования."""
+    """Пересобирает HTML из закешированных картинок — быстро, без сети и кодирования.
+
+    `width` — ширина, с которой картинки запечены (`Cached.width`); из неё считаются
+    те же `width`/`height` атрибуты, что и при первичной сборке.
+    """
     return render(
         webp_data_url(image_a),
         webp_data_url(image_b),
@@ -154,6 +210,7 @@ def render_cached(
         title=title,
         hint=hint,
         aspect=aspect,
+        width=width,
     )
 
 
@@ -185,21 +242,6 @@ def _qualities(start_quality: int, min_quality: int) -> list[int]:
     if qualities[-1] != min_quality:
         qualities.append(min_quality)
     return qualities
-
-
-def _aspect_pair(aspect) -> tuple[int, int]:
-    """Принимает `(3, 2)` или `'3:2'` и возвращает пару положительных чисел."""
-    if isinstance(aspect, str):
-        left, _, right = aspect.partition(":")
-        try:
-            pair = (int(left), int(right))
-        except ValueError as exc:
-            raise ImageError(f"Непонятные пропорции: {aspect}.") from exc
-    else:
-        pair = (int(aspect[0]), int(aspect[1]))
-    if pair[0] <= 0 or pair[1] <= 0:
-        raise ImageError("Пропорции картинки заданы неверно.")
-    return pair
 
 
 def _candidates(qualities: list[int], *, include_soft: bool) -> list[tuple[str, int, bool]]:
@@ -269,6 +311,7 @@ def _pairs(
                 title=title,
                 hint=hint,
                 aspect=aspect,
+                width=width,
             )
             raw = len(html.encode("utf-8"))
             z = zsize(html)
