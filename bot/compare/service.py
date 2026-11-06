@@ -25,6 +25,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from dataclasses import dataclass, field
+from types import SimpleNamespace
 
 from aiogram.types import BufferedInputFile, InputMediaDocument
 
@@ -44,6 +45,10 @@ NEED_TWO_TEXT = (
 #: Не удалось уложить картинки в лимиты виджета.
 TOO_LARGE_TEXT = (
     "Картинки слишком пёстрые, чтобы уместиться в бабл — пришлите картинки поменьше."
+)
+#: Такого номера в кеше нет (или он чужой).
+MISSING_ID_TEXT = (
+    "Сравнение #{id} не найдено или истекло. Пришлите две картинки: /cmp"
 )
 
 #: Ключ буфера альбома: `(chat_id, media_group_id)` или `(chat_id, message_id)`.
@@ -403,6 +408,56 @@ async def _send_fallback(message, caption: str, built: build.Built) -> None:
 
     await message.answer(
         f"{caption}\n\n⚠️ Клиент не принял виджет — отправляю обе картинки альбомом."
+    )
+
+
+async def resend_cached(message, digits: str) -> None:
+    """Повторно отправляет бабл из кеша по номеру: `/cmp #224259`.
+
+    Нужен, когда inline-выдача бабл не принимает: так номер всё равно даёт
+    виджет — сообщением от бота в том же чате.
+    """
+    store = get_store()
+    owner_id = None if settings.cmp_share_by_id else message.from_user.id
+    cached = await store.get(digits, owner_id=owner_id)
+    if cached is None:
+        await message.answer(MISSING_ID_TEXT.format(id=digits))
+        log.info(
+            "cmp #%s: не найден (user=%s, owner=%s, share_by_id=%s)",
+            digits, message.from_user.id, owner_id, settings.cmp_share_by_id,
+        )
+        return
+
+    labels = settings.cmp_labels_pair
+    caption = settings.cmp_caption.format(id=cached.id, a=labels[0], b=labels[1])
+    html = build.render_cached(
+        image_a=cached.image_a,
+        image_b=cached.image_b,
+        labels=labels,
+        title=settings.cmp_title,
+        hint=settings.cmp_hint,
+        aspect=cached.aspect,
+        width=cached.width,
+    )
+
+    api = api_module.get_api()
+    try:
+        await api.send_widget(message.chat.id, html, caption=caption, width=0, height=0)
+    except api_module.WidgetAPIError as exc:
+        log.warning(
+            "sendWidget из кеша не принят (user=%s, cmp=#%s): код=%s, описание=%s",
+            message.from_user.id, cached.id, exc.code, exc.description,
+        )
+        await _send_fallback(
+            message,
+            caption,
+            SimpleNamespace(image_a=cached.image_a, image_b=cached.image_b),
+        )
+        return
+
+    log.info(
+        "cmp #%s: бабл отправлен из кеша (user=%s, chat=%s, width=%d, zlib=%d)",
+        cached.id, message.from_user.id, message.chat.id, cached.width, cached.zlib_bytes,
     )
 
 

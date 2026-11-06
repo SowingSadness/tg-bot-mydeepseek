@@ -31,6 +31,8 @@ router.message.filter(F.chat.type == ChatType.PRIVATE)
 _URL_RE = re.compile(r"https?://\S+")
 # Хвостовая пунктуация из текста сообщения не часть ссылки.
 _URL_TAIL = ".,;"
+#: `/cmp #224259` (можно `/cmp@bot #224259`) — повторная отправка бабла из кеша.
+_ID_ARG_RE = re.compile(r"/cmp(?:@\w+)?\s+#(\d{6,8})", re.IGNORECASE)
 
 
 class AlbumContinuation(Filter):
@@ -80,6 +82,12 @@ async def on_cmp(message: Message) -> None:
     urls = [url for url in urls if url]
     reply = _reply_image(message)
     own_image = bool(getattr(message, "photo", None) or getattr(message, "document", None))
+
+    # `/cmp #224259` — бабл из кеша: запасной путь, когда inline его не вставляет.
+    id_match = _ID_ARG_RE.fullmatch(text.strip())
+    if id_match is not None and not urls and not own_image and reply is None:
+        await service.resend_cached(message, id_match.group(1))
+        return
 
     try:
         # Две ссылки — сразу сравниваем, даже если в сообщении/ответе есть картинка.

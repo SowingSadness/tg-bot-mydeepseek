@@ -78,6 +78,9 @@ async def test_resolve_file_path_raises_when_everything_fails(
 
 async def test_download_photo_returns_bytes(monkeypatch: pytest.MonkeyPatch) -> None:
     async def fake_path(base: str, token: str, file_id: str) -> str:
+        # Прод в этом тесте «медленный»: победить должен бета-контур.
+        if base == PROD:
+            await asyncio.sleep(0.05)
         return "photos/file_1.jpg"
 
     downloaded: list[tuple[str, str]] = []
@@ -100,6 +103,9 @@ async def test_download_photo_switches_contour_when_file_missing(
     """Контуры нумеруют файлы по-разному: путь перезапрашивается у резерва."""
 
     async def fake_path(base: str, token: str, file_id: str) -> str:
+        # Бета отвечает первой, прод — только если бета не смогла скачать файл.
+        if base == PROD:
+            await asyncio.sleep(0.05)
         return "beta/file_1" if base == BETA else "prod/file_7.jpg"
 
     async def fake_bytes(base: str, token: str, file_path: str) -> bytes:

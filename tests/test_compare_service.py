@@ -629,3 +629,76 @@ def test_sequential_mode_is_gone():
         assert not hasattr(compare_handlers, name), name
     assert "Awaiting" "Images" not in compare_handlers.__all__
     assert not hasattr(settings, "cmp_" "pending_ttl")
+
+
+# ------------------------------------------------------- /cmp #номер из кеша
+
+
+class CachedStore:
+    """Кеш-двойник для повторной отправки: отдаёт готовое сравнение или ничего."""
+
+    def __init__(self, calls: list, item=None) -> None:
+        self.calls = calls
+        self.item = item
+
+    async def get(self, cmp_id: str, *, owner_id: int | None = None):
+        self.calls.append(("store.get", cmp_id, owner_id))
+        return self.item
+
+
+def _cached(cmp_id: str = CMP_ID, owner_id: int = USER_ID):
+    from bot.compare.store import Cached
+
+    return Cached(
+        id=cmp_id,
+        owner_id=owner_id,
+        created_at=0.0,
+        width=430,
+        quality=34,
+        labels=("До", "После"),
+        zlib_bytes=1024,
+        image_a=b"RIFF-a-webp-bytes",
+        image_b=b"RIFF-b-webp-bytes",
+    )
+
+
+async def test_cmp_with_number_resends_widget_from_cache(env):
+    """/cmp #482913 в личке — бабл из кеша без скачиваний и без DeepSeek."""
+    env.calls.clear()
+    store = CachedStore(env.calls, _cached())
+    service.configure_store(store)
+    message = FakeMessage(env.calls, text=f"/cmp #{CMP_ID}")
+
+    await compare_handlers.on_cmp(message)
+
+    assert ("store.get", CMP_ID, USER_ID) in env.calls
+    widgets = _widgets(env.calls)
+    assert len(widgets) == 1
+    assert widgets[0][1] == CHAT_ID
+    assert f"#{CMP_ID}" in widgets[0][3]
+    assert not message.media_groups
+
+
+async def test_cmp_with_unknown_number_reports_and_sends_nothing(env):
+    env.calls.clear()
+    service.configure_store(CachedStore(env.calls, None))
+    message = FakeMessage(env.calls, text=f"/cmp #{CMP_ID}")
+
+    await compare_handlers.on_cmp(message)
+
+    assert any(f"#{CMP_ID}" in answer and "не найдено" in answer for answer in message.answers)
+    assert not _widgets(env.calls)
+    assert not message.media_groups
+
+
+async def test_cmp_with_number_falls_back_to_album_when_widget_refused(env):
+    """/cmp #номер — тот же фолбэк, что и при первом сравнении."""
+    env.calls.clear()
+    api_module.configure(FakeAPI(env.calls, WidgetAPIError(400, "INPUT_MEDIA_WIDGET_NOT_ALLOWED")))
+    service.configure_store(CachedStore(env.calls, _cached()))
+    message = FakeMessage(env.calls, text=f"/cmp #{CMP_ID}")
+
+    await compare_handlers.on_cmp(message)
+
+    assert len(message.media_groups) == 1
+    assert any(f"#{CMP_ID}" in answer for answer in message.answers)

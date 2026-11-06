@@ -61,10 +61,15 @@ class FakeStore:
 
 
 class FakeAPI:
-    """Bot API: записывает аргументы `answer_inline`, умеет бросить ошибку."""
+    """Bot API: записывает аргументы `answer_inline`; ошибки — поочерёдно или всегда."""
 
-    def __init__(self, error: BaseException | None = None) -> None:
+    def __init__(
+        self,
+        error: BaseException | None = None,
+        errors: list[BaseException | None] | None = None,
+    ) -> None:
         self.error = error
+        self.errors = list(errors or [])
         self.calls: list[dict] = []
 
     async def answer_inline(
@@ -83,8 +88,9 @@ class FakeAPI:
                 "is_personal": is_personal,
             }
         )
-        if self.error is not None:
-            raise self.error
+        error = self.errors.pop(0) if self.errors else self.error
+        if error is not None:
+            raise error
 
 
 def make_query(text: str, user_id: int = USER_ID) -> SimpleNamespace:
@@ -109,6 +115,8 @@ def _clean_singletons(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr(service, "_store", None)
     monkeypatch.setattr(api_module, "_api", None)
     monkeypatch.setattr(settings, "cmp_share_by_id", False)
+    # Отказ виджетов запоминается в модуле — в тестах стартуем с «виджеты разрешены».
+    monkeypatch.setattr(compare_inline, "_widgets_blocked", False)
     yield
 
 
@@ -257,6 +265,45 @@ async def test_widget_api_error_is_swallowed():
     configure(FakeStore(cached()), api)
 
     assert await compare_inline.try_answer(make_query(f"#{CMP_ID}")) is True
+
+
+async def test_refused_widget_falls_back_to_text_with_number():
+    """Виджеты в inline не проходят: отдаём номер текстом, а не пустую выдачу."""
+    api = FakeAPI(error=WidgetAPIError(400, "INPUT_MEDIA_WIDGET_NOT_ALLOWED"))
+    configure(FakeStore(cached()), api)
+
+    assert await compare_inline.try_answer(make_query(f"#{CMP_ID}")) is True
+
+    assert len(api.calls) == 2
+    last = api.calls[-1]["results"][0]
+    assert "message_text" in last["input_message_content"]
+    assert CMP_ID in last["input_message_content"]["message_text"]
+    assert f"/cmp #{CMP_ID}" in last["input_message_content"]["message_text"]
+
+
+async def test_refusal_is_remembered_until_restart(monkeypatch: pytest.MonkeyPatch):
+    """После первого отказа виджет больше не запрашивается: только текст."""
+    monkeypatch.setattr(compare_inline, "_widgets_blocked", False)
+    api = FakeAPI(error=WidgetAPIError(400, "INPUT_MEDIA_WIDGET_NOT_ALLOWED"))
+    configure(FakeStore(cached()), api)
+
+    assert await compare_inline.try_answer(make_query(f"#{CMP_ID}")) is True
+    assert compare_inline._widgets_blocked is True
+    first = len(api.calls)
+
+    assert await compare_inline.try_answer(make_query(f"#{CMP_ID}")) is True
+    assert len(api.calls) == first + 1
+    assert "message_text" in api.calls[-1]["results"][0]["input_message_content"]
+
+
+async def test_query_id_invalid_keeps_widget_path(monkeypatch: pytest.MonkeyPatch):
+    """Истёкший query ID — не повод выключать виджеты: флаг не ставится."""
+    monkeypatch.setattr(compare_inline, "_widgets_blocked", False)
+    api = FakeAPI(error=WidgetAPIError(400, "QUERY_ID_INVALID"))
+    configure(FakeStore(cached()), api)
+
+    assert await compare_inline.try_answer(make_query(f"#{CMP_ID}")) is True
+    assert compare_inline._widgets_blocked is False
 
 
 async def test_without_configure_returns_false():

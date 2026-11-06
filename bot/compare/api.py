@@ -10,12 +10,19 @@
 from __future__ import annotations
 
 import asyncio
+import json
+import logging
 from typing import Any, Awaitable, Callable
 
 import aiohttp
 
+log = logging.getLogger(__name__)
+
 # Сколько раз повторяем запрос, если сервер вернул `parameters.retry_after`.
 MAX_RETRIES = 2
+
+#: Сколько символов ответа Bot API показывать в логе.
+LOG_BODY_LIMIT = 400
 
 #: Транспорт: `(url, json_payload) -> (http_status, json_payload)`.
 Transport = Callable[[str, dict], Awaitable[tuple[int, dict]]]
@@ -46,6 +53,31 @@ class WidgetAPIError(Exception):
 
 class WidgetAPI:
     """Клиент методов Bot API 10.4, нужных для HTML-баблов сравнения."""
+
+    @staticmethod
+    def _describe(params: dict) -> str:
+        """Краткое описание запроса для лога: без HTML и токена, но с размерами."""
+        parts: list[str] = []
+        for key, value in params.items():
+            if isinstance(value, str):
+                parts.append(f"{key}={len(value.encode('utf-8'))}б")
+            elif isinstance(value, list):
+                ids = [str(item.get("id", "?")) for item in value if isinstance(item, dict)]
+                parts.append(f"{key}[{len(value)}]={','.join(ids)}")
+            else:
+                parts.append(f"{key}={value!r}")
+        return " ".join(parts)
+
+    @staticmethod
+    def _describe_response(payload: Any) -> str:
+        """Тело ответа Bot API одной строкой: именно там живёт причина отказа."""
+        try:
+            text = json.dumps(payload, ensure_ascii=False)
+        except (TypeError, ValueError):
+            text = repr(payload)
+        if len(text) > LOG_BODY_LIMIT:
+            text = text[:LOG_BODY_LIMIT] + "…"
+        return text
 
     def __init__(
         self,
@@ -152,12 +184,21 @@ class WidgetAPI:
     async def call(self, method: str, **params: Any) -> Any:
         """Вызов метода: POST JSON, разбор ответа, `retry_after` ≤ `MAX_RETRIES` повторов."""
         url = self.url(method)
+        log.debug("Bot API %s (%s): %s", method, self.base, self._describe(params))
         retries = 0
         while True:
             status, payload = await self._post(url, params)
             try:
                 return self._parse(method, status, payload)
             except WidgetAPIError as exc:
+                log.warning(
+                    "Bot API %s (%s): HTTP %s, запрос: %s, ответ: %s",
+                    method,
+                    self.base,
+                    status,
+                    self._describe(params),
+                    self._describe_response(payload),
+                )
                 if exc.retry_after is None or retries >= MAX_RETRIES:
                     raise
                 retries += 1
