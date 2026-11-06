@@ -6,7 +6,7 @@ import asyncio
 import logging
 from contextlib import suppress
 
-from aiogram import Bot, Dispatcher
+from aiogram import BaseMiddleware, Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
 from aiogram.types import BotCommand
 
@@ -45,13 +45,80 @@ def commands() -> list[BotCommand]:
     ]
 
 
+def _describe_update(update) -> str:  # noqa: ANN001
+    """Одна строка про апдейт: что пришло, из какого чата и от кого.
+
+    Нужна для разбора «бот молчит»: по этой строке видно, дошло ли сообщение
+    до бота вообще (в группах с включённым privacy mode доходят только команды).
+    """
+    message = (
+        getattr(update, "message", None)
+        or getattr(update, "edited_message", None)
+        or getattr(update, "channel_post", None)
+    )
+    if message is None:
+        kind = next(
+            (
+                name
+                for name in (
+                    "inline_query",
+                    "callback_query",
+                    "chosen_inline_result",
+                    "edited_message",
+                )
+                if getattr(update, name, None) is not None
+            ),
+            "другой",
+        )
+        return f"{kind} (без message)"
+
+    chat = getattr(message, "chat", None)
+    user = getattr(message, "from_user", None)
+    content = "text"
+    for name in (
+        "photo",
+        "document",
+        "video",
+        "animation",
+        "sticker",
+        "voice",
+        "audio",
+        "media_group_id",
+    ):
+        if getattr(message, name, None):
+            content = name
+            break
+    text = (getattr(message, "text", None) or getattr(message, "caption", None) or "").strip()
+    if text:
+        text = text.replace("\n", " ")[:40]
+    return (
+        f"{content} chat={getattr(chat, 'id', '-')}/{getattr(chat, 'type', '-')} "
+        f"user={getattr(user, 'id', '-')} text={text!r}"
+    )
+
+
+class UpdateLogMiddleware(BaseMiddleware):
+    """Пишет каждый входящий апдейт в лог: без этого непонятно, дошёл ли он до бота."""
+
+    async def __call__(self, handler, event, data):  # noqa: ANN001, ANN401
+        update = data.get("event_update") or event
+        log.info(
+            "update %s: %s",
+            getattr(update, "update_id", "-"),
+            _describe_update(update),
+        )
+        return await handler(event, data)
+
+
 def build_dispatcher() -> Dispatcher:
     """Собирает диспетчер и роутеры.
 
-    Порядок важен: `/cmp` подключается **раньше** `private`, иначе catch-all
-    `F.text.startswith("/")` в `private` отвечает «Неизвестная команда» на `/cmp`.
+    Порядок важен: `/cmp` подключается **раньше** `private` и `group`, иначе
+    catch-all `F.text.startswith("/")` в `private` и обработчик `F.text` в `group`
+    съели бы команду.
     """
     dispatcher = Dispatcher()
+    dispatcher.update.outer_middleware(UpdateLogMiddleware())
     dispatcher.include_router(inline.router)
     dispatcher.include_router(compare.router)
     dispatcher.include_router(private.router)

@@ -211,12 +211,18 @@ def _flush(key: AlbumKey) -> None:
                 key,
                 len(album.images),
             )
+        else:
+            log.info("cmp: в альбоме %s две картинки — запускаю сравнение", key)
         _close(key)
         asyncio.create_task(
             compare_images(album.message, album.images[0], album.images[1])
         )
         return
 
+    log.info(
+        "cmp: в альбоме %s только %d картинка — отправляю подсказку",
+        key, len(album.images),
+    )
     asyncio.create_task(album.message.answer(_need_two_text(album.message)))
 
 
@@ -289,6 +295,10 @@ async def arm_album(message) -> None:
     album.pending += 1
     album.first_pending = True
     _schedule(key, album)
+    log.info(
+        "cmp: старт альбома chat=%s key=%s (ждём вторую картинку %.2f с)",
+        message.chat.id, key, _album_wait(),
+    )
 
     try:
         raw = await download_message_image(message)
@@ -331,12 +341,22 @@ async def add_album_image(message) -> None:
 
     album.message = message
     album.images.append(raw)
+    log.info(
+        "cmp: в альбом %s добавлена картинка (%d байт, всего %d)",
+        key, len(raw), len(album.images),
+    )
     _after_append(key, album)
 
 
 async def compare_images(message, a: bytes, b: bytes) -> None:
     """Собирает бабл, кладёт сжатые WebP в кеш и отправляет виджет с номером."""
     labels = settings.cmp_labels_pair
+    log.info(
+        "cmp: сравниваю (chat=%s user=%s, %d и %d байт)",
+        getattr(message.chat, "id", "-"),
+        getattr(message.from_user, "id", "-"),
+        len(a), len(b),
+    )
 
     try:
         img_a = images.load(a)
@@ -397,6 +417,11 @@ async def compare_images(message, a: bytes, b: bytes) -> None:
         )
         await _send_fallback(message, caption, built)
         return
+
+    log.info(
+        "cmp #%s: бабл отправлен (chat=%s, width=%d, zlib=%d)",
+        cmp_id, message.chat.id, built.width, built.zlib_bytes,
+    )
 
     if settings.cmp_show_hint:
         await message.answer(

@@ -93,6 +93,16 @@ async def on_cmp(message: Message) -> None:
     urls = [url for url in urls if url]
     reply = _reply_image(message)
     own_image = bool(getattr(message, "photo", None) or getattr(message, "document", None))
+    log.info(
+        "cmp: чат=%s/%s user=%s текст=%r ссылок=%d своя_картинка=%s ответ_на_картинку=%s",
+        getattr(message.chat, "id", "-"),
+        getattr(message.chat, "type", "-"),
+        getattr(user, "id", "-"),
+        text[:60],
+        len(urls),
+        own_image,
+        reply is not None,
+    )
 
     # `/cmp #224259` — бабл из кеша: запасной путь, когда inline его не вставляет.
     id_match = _ID_ARG_RE.fullmatch(text.strip())
@@ -140,6 +150,12 @@ async def on_album_image(message: Message) -> None:
         return
     if not is_allowed(user.id):
         return await deny(message)
+    log.info(
+        "cmp: продолжение альбома chat=%s message_id=%s group=%s",
+        getattr(message.chat, "id", "-"),
+        getattr(message, "message_id", "-"),
+        getattr(message, "media_group_id", None),
+    )
     await service.add_album_image(message)
 
 
