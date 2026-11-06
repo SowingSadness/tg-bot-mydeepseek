@@ -326,7 +326,10 @@ async def test_page_is_served_as_html(client: TestClient) -> None:
         assert response.headers.get("Cache-Control") == "no-cache"
 
         body = await response.text()
-        assert body == PAGE
+        # Сравниваем текст, а не байты: сервер отдаёт файл как есть, а переводы
+        # строк в рабочей копии зависят от core.autocrlf/gitattributes (на Windows
+        # файл может оказаться с CRLF). Для содержимого страницы это не важно.
+        assert body.replace("\r\n", "\n") == PAGE
         assert '<meta charset="utf-8">' in body
         for needle in (
             TELEGRAM_SCRIPT,
