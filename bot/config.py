@@ -69,11 +69,11 @@ class Settings(BaseSettings):
     cmp_aspect: str = "3:2"
     cmp_id_digits: int = 6
     cmp_share_by_id: bool = False
-    cmp_show_hint: bool = True
     cmp_allow_private_hosts: bool = False
     cmp_labels: str = "До|После"
     # Подпись под баблом. Доступны {id}, {a}, {b}, {bot}; многострочность — через `\n`.
-    cmp_caption: str = "Номер сравнения:\n@{bot} #{id}"
+    # Отдельного сообщения с номером больше нет: номер живёт только здесь.
+    cmp_caption: str = "@{bot} #{id}"
     cmp_title: str = "Сравнение"
     cmp_hint: str = "Проведите ↔"
     # Short name мини-аппа из BotFather для кнопки «Открыть сравнение».
@@ -85,6 +85,11 @@ class Settings(BaseSettings):
     # Бета Bot API отклоняет widget в inline (INPUT_MEDIA_WIDGET_NOT_ALLOWED),
     # поэтому по умолчанию false: остаются фото-превью, кнопка и текстовый результат.
     cmp_inline_widget: bool = False
+    # Пробовать ли sendWidget вне личных чатов. Бета Bot API доставляет виджеты
+    # только в личку, а в группах/каналах отвечает INPUT_MEDIA_WIDGET_NOT_ALLOWED,
+    # поэтому по умолчанию false: в группе сразу уходит альбом из картинок.
+    # true = старое поведение «пробуем виджет везде» (на случай GA для групп).
+    cmp_widget_group: bool = False
 
     # Мини-апп сравнения (/app/cmp): отдельный aiohttp-сервер в процессе бота.
     # 0 = сервер не поднимается (поведение как раньше). TLS — снаружи (nginx/Caddy).

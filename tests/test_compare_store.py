@@ -81,16 +81,29 @@ async def test_reopen_finds_identical_record(tmp_path: Path):
     assert cached.aspect == "3:2"
 
 
-async def test_aspect_round_trips(store: ComparisonStore):
+async def test_aspect_round_trips_and_defaults_to_3_2(store: ComparisonStore):
     cmp_id = await _save(store, aspect="4:3")
-
     cached = await store.get(cmp_id)
-
     assert cached is not None
     assert cached.aspect == "4:3"
 
+    # Без явного `aspect` новая запись получает дефолт 3:2 (текущий AR бабла).
+    default_id = await store.save(
+        7,
+        image_a=IMAGE_A,
+        image_b=IMAGE_B,
+        width=430,
+        quality=34,
+        labels=LABELS,
+        zlib_bytes=1024,
+    )
+    cached = await store.get(default_id)
+    assert cached is not None
+    assert isinstance(cached.aspect, str)
+    assert cached.aspect == "3:2"
 
-async def test_get_filters_by_owner(store: ComparisonStore):
+
+async def test_get_filters_by_owner_and_unknown_id(store: ComparisonStore):
     cmp_id = await _save(store, owner_id=7)
 
     assert await store.get(cmp_id, owner_id=8) is None
@@ -101,13 +114,11 @@ async def test_get_filters_by_owner(store: ComparisonStore):
     assert shared.owner_id == 7
     assert shared.image_b == IMAGE_B
 
-
-async def test_get_unknown_id_returns_none(store: ComparisonStore):
     assert await store.get("000000") is None
     assert await store.get("000000", owner_id=7) is None
 
 
-async def test_preview_file_id_defaults_to_none_and_round_trips(store: ComparisonStore):
+async def test_preview_file_id_round_trip_update_and_noop(store: ComparisonStore):
     """`preview_file_id` — необязательное украшение: без него NULL, с ним — сохраняется."""
     plain_id = await _save(store)
     plain = await store.get(plain_id)
@@ -124,22 +135,22 @@ async def test_preview_file_id_defaults_to_none_and_round_trips(store: Compariso
         preview_file_id="AgACAgIAAxkBAAI",
     )
     cached = await store.get(with_preview)
-
     assert cached is not None
     assert cached.preview_file_id == "AgACAgIAAxkBAAI"
 
+    await store.set_preview_file_id(plain_id, "file-id-after-upload")
+    updated = await store.get(plain_id)
+    assert updated is not None
+    assert updated.preview_file_id == "file-id-after-upload"
 
-async def test_set_preview_file_id_updates_existing_record(store: ComparisonStore):
-    cmp_id = await _save(store)
-
-    await store.set_preview_file_id(cmp_id, "file-id-after-upload")
-    cached = await store.get(cmp_id)
-
-    assert cached is not None
-    assert cached.preview_file_id == "file-id-after-upload"
+    # Номер уже вычищен purge-ем — превью просто некуда писать, но и падать незачем.
+    before_noop = await store.count()
+    await store.set_preview_file_id("000000", "orphan-file-id")
+    assert await store.count() == before_noop
+    assert await store.get("000000") is None
 
 
-async def test_set_preview_file_id_survives_reopen(tmp_path: Path):
+async def test_preview_file_id_survives_reopen(tmp_path: Path):
     path = tmp_path / "cmp.db"
     first = ComparisonStore(path)
     try:
@@ -158,32 +169,15 @@ async def test_set_preview_file_id_survives_reopen(tmp_path: Path):
     assert cached.preview_file_id == "persisted-file-id"
 
 
-async def test_set_preview_file_id_for_unknown_id_is_noop(store: ComparisonStore):
-    """Номер уже вычищен purge-ем — превью просто некуда писать, но и падать незачем."""
-    await store.set_preview_file_id("000000", "orphan-file-id")
-
-    assert await store.count() == 0
-    assert await store.get("000000") is None
-
-
-async def test_purge_zero_ttl_removes_everything(store: ComparisonStore):
-    for index in range(3):
-        await _save(store, now=100.0 + index)
-
-    assert await store.count() == 3
-
-    # Реальные часы далеко впереди now=100..102, поэтому TTL=0 удаляет всё.
-    removed = await store.purge(ttl_seconds=0, max_entries=100)
-
-    assert removed == 3
-    assert await store.count() == 0
-
-
-async def test_purge_calls_on_removed_for_each_deleted_id(store: ComparisonStore):
+async def test_purge_zero_ttl_removes_everything_and_calls_on_removed(
+    store: ComparisonStore,
+):
     """`on_removed` получает каждый удалённый номер: по нему чистятся файлы оригиналов."""
     ids = [await _save(store, now=100.0 + index) for index in range(3)]
+    assert await store.count() == 3
     seen: list[str] = []
 
+    # Реальные часы далеко впереди now=100..102, поэтому TTL=0 удаляет всё.
     removed = await store.purge(ttl_seconds=0, max_entries=100, on_removed=seen.append)
 
     assert removed == 3
@@ -240,7 +234,9 @@ async def test_id_collision_retries_with_new_number(store: ComparisonStore, monk
     assert cached is not None and cached.image_a == IMAGE_A
 
 
-async def test_id_collision_grows_number_after_ten_tries(store: ComparisonStore, monkeypatch):
+async def test_id_collision_grows_number_after_ten_tries(
+    store: ComparisonStore, monkeypatch
+):
     monkeypatch.setattr("secrets.randbelow", lambda _bound: 0)
     first = await _save(store)
     assert first == "100000"
@@ -253,46 +249,31 @@ async def test_id_collision_grows_number_after_ten_tries(store: ComparisonStore,
     assert await store.count() == 2
 
 
-async def test_save_defaults_aspect_to_3_2(store: ComparisonStore):
-    """Без явного `aspect` новая запись получает дефолт 3:2 (текущий AR бабла)."""
-    cmp_id = await store.save(
-        7,
-        image_a=IMAGE_A,
-        image_b=IMAGE_B,
-        width=430,
-        quality=34,
-        labels=LABELS,
-        zlib_bytes=1024,
-    )
-
-    cached = await store.get(cmp_id)
-
-    assert cached is not None
-    assert isinstance(cached.aspect, str)
-    assert cached.aspect == "3:2"
-
-
-async def test_migrates_old_database_without_aspect(tmp_path: Path):
-    """Старая БД без колонки `aspect`: ALTER TABLE без заполнения, чтение → 4:3."""
-    path = tmp_path / "old.db"
+def _old_database(path: Path, columns: str, values: tuple) -> None:
     conn = sqlite3.connect(str(path))
     try:
-        conn.executescript(
-            """
-            CREATE TABLE comparisons (
-              id TEXT PRIMARY KEY, owner_id INTEGER NOT NULL, created_at REAL NOT NULL,
-              width INTEGER NOT NULL, quality INTEGER NOT NULL, labels TEXT NOT NULL,
-              zlib_bytes INTEGER NOT NULL, image_a BLOB NOT NULL, image_b BLOB NOT NULL
-            );
-            """
-        )
+        conn.executescript(f"CREATE TABLE comparisons ({columns});")
         conn.execute(
-            "INSERT INTO comparisons VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            ("482913", 7, 100.0, 430, 34, "До|После", 1024, IMAGE_A, IMAGE_B),
+            "INSERT INTO comparisons VALUES (" + ", ".join("?" * len(values)) + ")",
+            values,
         )
         conn.commit()
     finally:
         conn.close()
+
+
+async def test_migrates_old_database_columns(tmp_path: Path):
+    """Старые БД без `aspect`/`preview_file_id`: ALTER TABLE и понятные дефолты."""
+    path = tmp_path / "old.db"
+    _old_database(
+        path,
+        """
+        id TEXT PRIMARY KEY, owner_id INTEGER NOT NULL, created_at REAL NOT NULL,
+        width INTEGER NOT NULL, quality INTEGER NOT NULL, labels TEXT NOT NULL,
+        zlib_bytes INTEGER NOT NULL, image_a BLOB NOT NULL, image_b BLOB NOT NULL
+        """,
+        ("482913", 7, 100.0, 430, 34, "До|После", 1024, IMAGE_A, IMAGE_B),
+    )
 
     store = ComparisonStore(path)
     try:
@@ -323,31 +304,19 @@ async def test_migrates_old_database_without_aspect(tmp_path: Path):
     finally:
         await store.close()
 
+    preview_path = tmp_path / "old-preview.db"
+    _old_database(
+        preview_path,
+        """
+        id TEXT PRIMARY KEY, owner_id INTEGER NOT NULL, created_at REAL NOT NULL,
+        width INTEGER NOT NULL, quality INTEGER NOT NULL, labels TEXT NOT NULL,
+        zlib_bytes INTEGER NOT NULL, image_a BLOB NOT NULL, image_b BLOB NOT NULL,
+        aspect TEXT NOT NULL DEFAULT '3:2'
+        """,
+        ("482913", 7, 100.0, 430, 34, "До|После", 1024, IMAGE_A, IMAGE_B, "3:2"),
+    )
 
-async def test_migrates_old_database_without_preview_file_id(tmp_path: Path):
-    """Старая БД без `preview_file_id`: ALTER TABLE, старые строки читаются с NULL."""
-    path = tmp_path / "old-preview.db"
-    conn = sqlite3.connect(str(path))
-    try:
-        conn.executescript(
-            """
-            CREATE TABLE comparisons (
-              id TEXT PRIMARY KEY, owner_id INTEGER NOT NULL, created_at REAL NOT NULL,
-              width INTEGER NOT NULL, quality INTEGER NOT NULL, labels TEXT NOT NULL,
-              zlib_bytes INTEGER NOT NULL, image_a BLOB NOT NULL, image_b BLOB NOT NULL,
-              aspect TEXT NOT NULL DEFAULT '3:2'
-            );
-            """
-        )
-        conn.execute(
-            "INSERT INTO comparisons VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            ("482913", 7, 100.0, 430, 34, "До|После", 1024, IMAGE_A, IMAGE_B, "3:2"),
-        )
-        conn.commit()
-    finally:
-        conn.close()
-
-    store = ComparisonStore(path)
+    store = ComparisonStore(preview_path)
     try:
         cached = await store.get("482913")
         assert cached is not None
@@ -376,15 +345,19 @@ async def test_migrates_old_database_without_preview_file_id(tmp_path: Path):
         await store.close()
 
 
-async def test_creates_missing_directories(tmp_path: Path):
+async def test_store_lifecycle_creates_dirs_and_is_idempotent(tmp_path: Path):
     path = tmp_path / "a" / "b" / "cmp.db"
 
     store = ComparisonStore(path)
     try:
         assert path.exists()
+        assert await store.count() == 0
+        assert await store.count() == 0
         cmp_id = await _save(store)
         assert await store.get(cmp_id) is not None
+        assert await store.count() == 1
     finally:
+        await store.close()
         await store.close()
 
 
@@ -404,15 +377,3 @@ async def test_labels_round_trip_as_tuple(store: ComparisonStore):
     assert cached is not None
     assert isinstance(cached.labels, tuple)
     assert cached.labels == ("before", "after")
-
-
-async def test_count_and_close_are_idempotent(tmp_path: Path):
-    store = ComparisonStore(tmp_path / "cmp.db")
-    try:
-        assert await store.count() == 0
-        assert await store.count() == 0
-        await _save(store)
-        assert await store.count() == 1
-    finally:
-        await store.close()
-        await store.close()

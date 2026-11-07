@@ -25,16 +25,14 @@ def test_bases_are_beta_then_prod(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(respond.settings, "widget_api_base", BETA)
     assert respond._file_bases() == (BETA, PROD)
 
-
-def test_single_contour_when_beta_is_prod(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(respond.settings, "widget_api_base", PROD + "/")
     assert respond._file_bases() == (PROD,)
 
 
-async def test_resolve_file_path_takes_first_contour(
+async def test_resolve_file_path_takes_first_falls_back_and_raises(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Медленный прод (60 с в жизни) не должен задерживать ответ."""
+    """Медленный прод не задерживает ответ; если бета не знает файл — берём прод."""
 
     async def fake(base: str, token: str, file_id: str) -> str:
         if base == PROD:
@@ -46,39 +44,28 @@ async def test_resolve_file_path_takes_first_contour(
 
     assert await respond.resolve_file_path("123:test", "fid") == (f"{BETA}/path", BETA)
 
-
-async def test_resolve_file_path_falls_back_to_prod(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Если бета не знает файл — путь берётся у прода."""
-
-    async def fake(base: str, token: str, file_id: str) -> str:
+    async def fallback(base: str, token: str, file_id: str) -> str:
         if base == BETA:
             raise RuntimeError("beta: HTTP 404 на getFile")
         return "prod/path"
 
-    monkeypatch.setattr(respond, "_file_path_from", fake)
-    monkeypatch.setattr(respond.settings, "widget_api_base", BETA)
-
+    monkeypatch.setattr(respond, "_file_path_from", fallback)
     assert await respond.resolve_file_path("123:test", "fid") == ("prod/path", PROD)
 
-
-async def test_resolve_file_path_raises_when_everything_fails(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    async def fake(base: str, token: str, file_id: str) -> str:
+    async def broken(base: str, token: str, file_id: str) -> str:
         raise RuntimeError(f"{base}: нет связи")
 
-    monkeypatch.setattr(respond, "_file_path_from", fake)
-    monkeypatch.setattr(respond.settings, "widget_api_base", BETA)
-
+    monkeypatch.setattr(respond, "_file_path_from", broken)
     with pytest.raises(RuntimeError, match="нет связи"):
         await respond.resolve_file_path("123:test", "fid")
 
 
-async def test_download_photo_returns_bytes(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_download_photo_returns_bytes_and_switches_contour(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Прод «медленный» — побеждает бета; файл у беты битый — путь берём у прода."""
+
     async def fake_path(base: str, token: str, file_id: str) -> str:
-        # Прод в этом тесте «медленный»: победить должен бета-контур.
         if base == PROD:
             await asyncio.sleep(0.05)
         return "photos/file_1.jpg"
@@ -96,27 +83,19 @@ async def test_download_photo_returns_bytes(monkeypatch: pytest.MonkeyPatch) -> 
     assert await respond.download_photo(_message(), "fid") == b"jpeg"
     assert downloaded == [(BETA, "photos/file_1.jpg")]
 
-
-async def test_download_photo_switches_contour_when_file_missing(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Контуры нумеруют файлы по-разному: путь перезапрашивается у резерва."""
-
-    async def fake_path(base: str, token: str, file_id: str) -> str:
-        # Бета отвечает первой, прод — только если бета не смогла скачать файл.
+    # Контуры нумеруют файлы по-разному: путь перезапрашивается у резерва.
+    async def per_contour_path(base: str, token: str, file_id: str) -> str:
         if base == PROD:
             await asyncio.sleep(0.05)
         return "beta/file_1" if base == BETA else "prod/file_7.jpg"
 
-    async def fake_bytes(base: str, token: str, file_path: str) -> bytes:
+    async def beta_404(base: str, token: str, file_path: str) -> bytes:
         if base == BETA:
             raise RuntimeError(f"{base}: HTTP 404 на скачивании файла")
         return b"jpeg"
 
-    monkeypatch.setattr(respond, "_file_path_from", fake_path)
-    monkeypatch.setattr(respond, "_download_file_bytes", fake_bytes)
-    monkeypatch.setattr(respond.settings, "widget_api_base", BETA)
-
+    monkeypatch.setattr(respond, "_file_path_from", per_contour_path)
+    monkeypatch.setattr(respond, "_download_file_bytes", beta_404)
     assert await respond.download_photo(_message(), "fid") == b"jpeg"
 
 

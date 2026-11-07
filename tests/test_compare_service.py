@@ -17,11 +17,14 @@ from io import BytesIO
 from types import SimpleNamespace
 
 import pytest
+from aiogram.enums import ChatType
+from aiogram.types import InputMediaDocument, InputMediaPhoto
 from PIL import Image
 
 from bot.compare import api as api_module
 from bot.compare import build, images, service
 from bot.compare.api import WidgetAPIError
+from bot.compare.store import Cached
 from bot.config import settings
 from bot.handlers import compare as compare_handlers
 
@@ -47,6 +50,7 @@ PNG_B = png((20, 20, 200))
 
 class FakeChat:
     id = CHAT_ID
+    type: str | None = None
 
 
 class FakeUser:
@@ -98,10 +102,12 @@ class FakeMessage:
         reply_to_message=None,
         media_group_id: str | None = None,
         message_id: int = 1,
+        chat_type: str | None = None,
         bot: FakeBot | None = None,
     ) -> None:
         self.calls = calls
         self.chat = FakeChat()
+        self.chat.type = chat_type
         self.from_user = FakeUser(user_id)
         self.text = text
         self.caption = caption
@@ -152,11 +158,12 @@ def photo_message(
 
 
 class FakeStore:
-    """Кеш-двойник: считает сохранения и возвращает фиксированный номер."""
+    """Кеш-двойник: пишет сохранения, отдаёт `cached` и проверяет владельца."""
 
     def __init__(self, calls: list, cmp_id: str = CMP_ID) -> None:
         self.calls = calls
         self.cmp_id = cmp_id
+        self.cached: Cached | None = None
 
     async def save(self, owner_id: int, **kwargs) -> str:
         self.calls.append(("store.save", owner_id, kwargs))
@@ -166,7 +173,13 @@ class FakeStore:
         self.calls.append(("store.set_preview_file_id", cmp_id, file_id))
 
     async def get(self, cmp_id: str, *, owner_id: int | None = None):
-        return None
+        self.calls.append(("store.get", cmp_id, owner_id))
+        if self.cached is None:
+            return None
+        # Как настоящий store: чужой номер при `owner_id` не отдаётся.
+        if owner_id is not None and self.cached.owner_id != owner_id:
+            return None
+        return self.cached
 
 
 class FakeAPI:
@@ -316,9 +329,9 @@ async def test_album_of_two_photos_saves_once_and_clears_buffer(env, monkeypatch
     assert saves[0][2]["image_b"].startswith(b"RIFF")
     assert saves[0][2]["image_a"] != saves[0][2]["image_b"]
     assert len(_widgets(env.calls)) == 1
-    # Подсказка с номером — и ни одной просьбы дослать картинку.
-    assert any(f"#{CMP_ID}" in answer for answer in _answers(env.calls))
-    assert not any(service.NEED_TWO_TEXT in answer for answer in _answers(env.calls))
+    # Номер — только в подписи бабла; отдельных сообщений с номером нет.
+    assert f"#{CMP_ID}" in _widgets(env.calls)[0][3]
+    assert _answers(env.calls) == []
 
 
 async def test_album_key_is_reserved_before_first_photo_downloads(env, monkeypatch):
@@ -425,14 +438,15 @@ async def test_third_album_photo_is_dropped_not_sent_to_deepseek(
     assert service._closed == {}
 
 
-async def test_album_with_one_photo_answers_instruction_and_keeps_no_state(env, monkeypatch):
-    """Дебаунс истёк, а картинка одна → инструкция, никаких записей и состояния."""
+async def test_incomplete_album_answers_instruction_and_keeps_no_state(env, monkeypatch):
+    """Одно фото альбома и два одиночных фото — только инструкция, без записей."""
 
     async def fake_download_photo(message, file_id):
         return PNG_A
 
     monkeypatch.setattr("bot.respond.download_photo", fake_download_photo)
 
+    # Одно фото альбома: дебаунс истёк, картинка одна.
     message = photo_message(
         env.calls, "photo-1", caption="/cmp", media_group_id="group-1", message_id=10
     )
@@ -447,15 +461,7 @@ async def test_album_with_one_photo_answers_instruction_and_keeps_no_state(env, 
     assert not _saves(env.calls)
     assert not _widgets(env.calls)
 
-
-async def test_two_separate_photos_without_media_group_do_not_chain(env, monkeypatch):
-    """Два одиночных фото без альбома не склеиваются: второе — не продолжение."""
-
-    async def fake_download_photo(message, file_id):
-        return PNG_A
-
-    monkeypatch.setattr("bot.respond.download_photo", fake_download_photo)
-
+    # Два одиночных фото без альбома не склеиваются: второе — не продолжение.
     first = photo_message(env.calls, "photo-1", caption="/cmp", message_id=10)
     await compare_handlers.on_cmp(first)
     await settle()
@@ -558,7 +564,8 @@ async def test_one_url_plus_reply_photo_compares_immediately(env, monkeypatch):
     assert service._albums == {}
 
 
-async def test_cmp_without_arguments_asks_for_two_pictures(env):
+async def test_cmp_needs_two_pictures(env, monkeypatch):
+    """Ни аргументов, ни второй ссылки — инструкция, ни одной скачки URL."""
     message = FakeMessage(env.calls, text="/cmp")
     await compare_handlers.on_cmp(message)
 
@@ -567,8 +574,6 @@ async def test_cmp_without_arguments_asks_for_two_pictures(env):
     assert not _saves(env.calls)
     assert not _widgets(env.calls)
 
-
-async def test_cmp_with_single_url_asks_for_two_pictures(env, monkeypatch):
     called = False
 
     async def fake_download_url(session, url, *, max_bytes, timeout, allow_private):
@@ -586,11 +591,13 @@ async def test_cmp_with_single_url_asks_for_two_pictures(env, monkeypatch):
     assert not _saves(env.calls)
 
 
-async def test_compare_urls_error_reports_and_saves_nothing(env, monkeypatch):
-    async def fake_download(session, url, *, max_bytes, timeout, allow_private):
+async def test_compare_urls_errors_report_and_mask_tokens(env, monkeypatch, caplog):
+    """Ошибки скачивания не кешируются; URL с токеном в логе замаскирован."""
+
+    async def failing_download(session, url, *, max_bytes, timeout, allow_private):
         raise images.ImageError("Не удалось скачать картинку: сайт не ответил вовремя.")
 
-    monkeypatch.setattr(images, "download_url", fake_download)
+    monkeypatch.setattr(images, "download_url", failing_download)
     message = FakeMessage(env.calls)
     await service.compare_urls(message, ["https://a.test/one.jpg", "https://b.test/two.jpg"])
 
@@ -598,43 +605,40 @@ async def test_compare_urls_error_reports_and_saves_nothing(env, monkeypatch):
     assert not _saves(env.calls)
     assert not _widgets(env.calls)
 
-
-@pytest.mark.parametrize("query_key", ["startapp", "tgWebAppStartParam"])
-async def test_compare_urls_failure_log_masks_startapp_token(
-    env, monkeypatch, caplog, query_key
-):
-    """URL с токеном в логе замаскирован, а ответ и побочные эффекты — как раньше."""
     token = "337326_AbCdEfGhIjKlMnOpQrSt"
-    url = f"https://t.me/cmpbot?{query_key}={token}"
+    for query_key in ("startapp", "tgWebAppStartParam"):
+        caplog.clear()
+        env.calls.clear()
+        url = f"https://t.me/cmpbot?{query_key}={token}"
 
-    async def fake_download(session, url, *, max_bytes, timeout, allow_private):
-        raise RuntimeError(f"connection reset: {url}")
+        async def fake_download(session, url, *, max_bytes, timeout, allow_private):
+            raise RuntimeError(f"connection reset: {url}")
 
-    monkeypatch.setattr(images, "download_url", fake_download)
-    message = FakeMessage(env.calls)
-    with caplog.at_level(logging.INFO, logger=service.log.name):
-        await service.compare_urls(message, [url, "https://b.test/two.jpg"])
+        monkeypatch.setattr(images, "download_url", fake_download)
+        message = FakeMessage(env.calls)
+        with caplog.at_level(logging.INFO, logger=service.log.name):
+            await service.compare_urls(message, [url, "https://b.test/two.jpg"])
 
-    lines = [
-        record.getMessage()
-        for record in caplog.records
-        if record.name == service.log.name
-    ]
-    assert len(lines) == 1, caplog.text
-    line = lines[0]
-    assert token not in line
-    assert f"{query_key}=<redacted>" in line
-    assert "https://t.me/cmpbot" in line
-    assert "\n" not in line
-    assert [rec.levelno for rec in caplog.records if rec.name == service.log.name] == [
-        logging.INFO
-    ]
+        lines = [
+            record.getMessage()
+            for record in caplog.records
+            if record.name == service.log.name
+        ]
+        assert len(lines) == 1, caplog.text
+        line = lines[0]
+        assert token not in line
+        assert f"{query_key}=<redacted>" in line
+        assert "https://t.me/cmpbot" in line
+        assert "\n" not in line
+        assert [
+            rec.levelno for rec in caplog.records if rec.name == service.log.name
+        ] == [logging.INFO]
 
-    assert message.answers == [
-        "Не удалось скачать картинку по ссылке, попробуйте ещё раз."
-    ]
-    assert not _saves(env.calls)
-    assert not _widgets(env.calls)
+        assert message.answers == [
+            "Не удалось скачать картинку по ссылке, попробуйте ещё раз."
+        ]
+        assert not _saves(env.calls)
+        assert not _widgets(env.calls)
 
 
 async def test_non_image_document_with_cmp_caption_reports_and_keeps_no_state(env):
@@ -662,9 +666,8 @@ async def test_caption_contains_id_and_save_goes_before_send(env):
 
     widgets = _widgets(env.calls)
     assert len(widgets) == 1
-    # Подпись — две строки: заголовок и `@бот #номер` отдельной строкой.
-    assert widgets[0][3] == "Номер сравнения:\n@test_bot #482913"
-    assert "\n@test_bot" in widgets[0][3]
+    # Подпись — одна строка `@бот #номер`: номер больше нигде не дублируется.
+    assert widgets[0][3] == "@test_bot #482913"
     assert f"#{CMP_ID}" in widgets[0][3]
     assert widgets[0][1] == CHAT_ID
     assert widgets[0][4] == 0 and widgets[0][5] == 0
@@ -674,9 +677,8 @@ async def test_caption_contains_id_and_save_goes_before_send(env):
     names = _names(env.calls)
     assert names.index("store.save") < names.index("api.send_widget")
     assert _saves(env.calls)[0][2]["aspect"] == "3:2"
-    # Подсказка после успеха — тоже две строки, `@бот #номер` с новой строки.
-    assert message.answers == ["Номер сравнения: #482913\n@test_bot #482913"]
-    assert "\n@test_bot" in message.answers[0]
+    # После успешного виджета в личке — ни одного лишнего сообщения.
+    assert message.answers == []
 
 
 async def test_originals_are_saved_after_store_and_before_send(env):
@@ -701,8 +703,12 @@ async def test_originals_are_saved_after_store_and_before_send(env):
     )
 
 
-async def test_originals_failure_warns_and_keeps_widget_hint_and_preview(env, caplog):
-    """Сбой сохранения оригиналов: warning, но виджет, подсказка и превью на месте."""
+async def test_originals_failure_warns_and_keeps_widget_and_preview(env, caplog):
+    """Сбой сохранения оригиналов: warning, но виджет и превью на месте.
+
+    Отдельного сообщения с номером больше нет: после успешного виджета
+    `message.answers` пуст, номер виден только в подписи бабла.
+    """
     env.originals.error = RuntimeError("disk full")
     message = FakeMessage(env.calls)
 
@@ -712,12 +718,13 @@ async def test_originals_failure_warns_and_keeps_widget_hint_and_preview(env, ca
     assert "оригинал" in caplog.text and "disk full" in caplog.text
     assert f"#{CMP_ID}" in caplog.text
     assert len(_widgets(env.calls)) == 1
-    assert message.answers == ["Номер сравнения: #482913\n@test_bot #482913"]
+    assert message.answers == []
     assert len(_by_name(env.calls, "bot.send_photo")) == 1
     assert _by_name(env.calls, "store.set_preview_file_id")
 
 
 async def test_widget_api_error_falls_back_to_album_and_reports_id(env, caplog):
+    """Виджет отклонён: медиагруппа из JPEG-фото и номер текстом ровно один раз."""
     env.api.error = WidgetAPIError(400, "INPUT_MEDIA_WIDGET_NOT_ALLOWED")
     message = FakeMessage(env.calls)
     with caplog.at_level(logging.WARNING, logger=service.log.name):
@@ -727,8 +734,12 @@ async def test_widget_api_error_falls_back_to_album_and_reports_id(env, caplog):
     assert len(_saves(env.calls)) == 1
     assert len(message.media_groups) == 1
     media = message.media_groups[0]
-    assert [item.media.filename for item in media] == ["before.webp", "after.webp"]
-    assert any(f"#{CMP_ID}" in answer for answer in message.answers)
+    assert [item.type for item in media] == ["photo", "photo"]
+    assert [item.media.filename for item in media] == ["before.jpg", "after.jpg"]
+    assert all(item.media.data[:2] == b"\xff\xd8" for item in media)
+    assert len(message.answers) == 1
+    assert message.answers[0].count(f"#{CMP_ID}") == 1
+    assert "Клиент не принял виджет" in message.answers[0]  # личка: виджет действительно отклонён
 
 
 async def test_widget_too_large_reports_text_and_saves_nothing(env, monkeypatch, caplog):
@@ -784,11 +795,11 @@ async def test_preview_is_uploaded_deleted_and_file_id_saved_last(env):
     assert _by_name(env.calls, "store.set_preview_file_id") == [
         ("store.set_preview_file_id", CMP_ID, "preview-file-1")
     ]
-    assert any(f"#{CMP_ID}" in answer for answer in message.answers)
+    assert message.answers == []
 
 
-async def test_preview_send_failure_warns_and_keeps_widget_and_hint(env, caplog):
-    """send_photo упал: предупреждение в лог, file_id нет — но бабл и подсказка ушли."""
+async def test_preview_failures_warn_and_skip_file_id(env, caplog):
+    """send_photo/delete_message упали: warning, file_id не кешируем, /cmp не ломается."""
     message = FakeMessage(env.calls)
     message.bot.send_error = RuntimeError("network down")
 
@@ -798,13 +809,12 @@ async def test_preview_send_failure_warns_and_keeps_widget_and_hint(env, caplog)
     assert "превью" in caplog.text and "network down" in caplog.text
     assert f"#{CMP_ID}" in caplog.text
     assert len(_widgets(env.calls)) == 1
-    assert any(f"#{CMP_ID}" in answer for answer in message.answers)
+    assert message.answers == []
     assert not _by_name(env.calls, "store.set_preview_file_id")
     assert not _by_name(env.calls, "bot.delete_message")
 
-
-async def test_preview_delete_failure_warns_and_does_not_save_file_id(env, caplog):
-    """delete_message упал: сообщение осталось, file_id не кешируем, /cmp не ломается."""
+    caplog.clear()
+    env.calls.clear()
     message = FakeMessage(env.calls)
     message.bot.delete_error = RuntimeError("message to delete not found")
 
@@ -814,7 +824,7 @@ async def test_preview_delete_failure_warns_and_does_not_save_file_id(env, caplo
     assert "превью" in caplog.text and "delete" in caplog.text.lower()
     assert f"#{CMP_ID}" in caplog.text
     assert len(_widgets(env.calls)) == 1
-    assert any(f"#{CMP_ID}" in answer for answer in message.answers)
+    assert message.answers == []
     assert not _by_name(env.calls, "store.set_preview_file_id")
 
 
@@ -831,7 +841,8 @@ async def test_preview_is_uploaded_after_widget_fallback(env):
     ]
 
 
-async def test_not_an_image_reports_text_and_saves_nothing(env):
+async def test_image_error_reports_and_warns(env, monkeypatch, caplog):
+    """Не-картинка и `images.ImageError`: пользователю текст, в лог — контекст."""
     message = FakeMessage(env.calls)
     await service.compare_images(message, b"this is not an image", PNG_B)
 
@@ -840,16 +851,12 @@ async def test_not_an_image_reports_text_and_saves_nothing(env):
     assert not _saves(env.calls)
     assert not _widgets(env.calls)
 
-
-async def test_image_error_warns_with_context_and_keeps_user_text(
-    env, monkeypatch, caplog
-):
-    """`images.ImageError` в сборке: WARNING с chat/user/причиной, ответ прежний."""
-
     def boom(_data):
         raise images.ImageError("картинка битая")
 
     monkeypatch.setattr(service.images, "load", boom)
+    caplog.clear()
+    env.calls.clear()
     message = FakeMessage(env.calls)
     with caplog.at_level(logging.WARNING, logger=service.log.name):
         await service.compare_images(message, PNG_A, PNG_B)
@@ -869,6 +876,312 @@ async def test_image_error_warns_with_context_and_keeps_user_text(
     assert "\n" not in line
     assert not _saves(env.calls)
     assert not _widgets(env.calls)
+
+
+# ------------------------------------------------------- widget branch / texts
+
+
+GROUP_CHATS = ["group", "supergroup", "channel"]
+
+
+@pytest.mark.parametrize("chat_type", GROUP_CHATS)
+def test_widget_allowed_false_for_groups_supergroups_and_channels(
+    monkeypatch, chat_type
+):
+    """В группах/супергруппах/каналах виджет по умолчанию не пробуем."""
+    monkeypatch.setattr(settings, "cmp_widget_group", False)
+    assert service._widget_allowed(SimpleNamespace(type=chat_type)) is False
+
+
+@pytest.mark.parametrize("chat_type", GROUP_CHATS)
+def test_widget_allowed_true_for_groups_with_cmp_widget_group(
+    monkeypatch, chat_type
+):
+    """`CMP_WIDGET_GROUP=true` возвращает старое поведение «пробуем виджет везде»."""
+    monkeypatch.setattr(settings, "cmp_widget_group", True)
+    assert service._widget_allowed(SimpleNamespace(type=chat_type)) is True
+
+
+def test_widget_allowed_private_and_unknown_type_are_private(monkeypatch):
+    """Личка и неизвестный/`None` тип (частичные двойники) — виджет разрешён."""
+    monkeypatch.setattr(settings, "cmp_widget_group", False)
+    for chat in (
+        SimpleNamespace(type="private"),
+        SimpleNamespace(type=None),
+        SimpleNamespace(),
+    ):
+        assert service._widget_allowed(chat) is True
+
+
+def test_widget_allowed_understands_chat_type_enum(monkeypatch):
+    """aiogram кладёт в `chat.type` `ChatType.*`: `str()` там даёт "ChatType.GROUP"."""
+    monkeypatch.setattr(settings, "cmp_widget_group", False)
+    for chat_type in (ChatType.GROUP, ChatType.SUPERGROUP, ChatType.CHANNEL):
+        chat = SimpleNamespace(type=chat_type)
+        assert service._chat_type(chat) == chat_type.value
+        assert service._widget_allowed(chat) is False
+    assert service._chat_type(SimpleNamespace(type=ChatType.PRIVATE)) == "private"
+
+
+def test_need_two_text_mentions_privacy_mode_only_in_groups():
+    """Подсказка про `/setprivacy` нужна только там, где доходит не всё фото."""
+    for chat_type in ("group", "supergroup", ChatType.GROUP):
+        text = service._need_two_text(FakeMessage([], chat_type=chat_type))
+        assert text.startswith(service.NEED_TWO_TEXT)
+        assert "privacy mode" in text
+        assert "setprivacy" in text
+
+    private = service._need_two_text(FakeMessage([], chat_type="private"))
+    assert private == service.NEED_TWO_TEXT
+    assert "privacy" not in private
+
+
+async def test_group_chat_sends_jpeg_album_instead_of_widget(env, caplog, monkeypatch):
+    """Группа: `sendWidget` даже не зовём — сразу JPEG-альбом и номер текстом один раз."""
+    monkeypatch.setattr(settings, "cmp_widget_group", False)
+    message = FakeMessage(env.calls, chat_type=ChatType.GROUP)
+
+    with caplog.at_level(logging.INFO, logger=service.log.name):
+        await service.compare_images(message, PNG_A, PNG_B)
+
+    assert not _widgets(env.calls)
+    assert len(message.media_groups) == 1
+    media = message.media_groups[0]
+    assert [item.type for item in media] == ["photo", "photo"]
+    assert not any(isinstance(item, InputMediaDocument) for item in media)
+    assert [item.media.filename for item in media] == ["before.jpg", "after.jpg"]
+    assert all(item.media.data[:2] == b"\xff\xd8" for item in media)
+
+    assert len(message.answers) == 1
+    text = message.answers[0]
+    assert text.count(f"#{CMP_ID}") == 1
+    assert "Клиент не принял виджет" not in text  # в группе попытки не было
+    assert "виджеты" in text and "альбомом" in text
+    assert f"виджеты в чате group недоступны" in caplog.text
+    # Превью — украшение и в групповой ветке никуда не делось.
+    assert _by_name(env.calls, "store.set_preview_file_id")
+
+
+async def test_fallback_album_failure_still_sends_number_and_logs_exception(
+    env, caplog, monkeypatch
+):
+    """Медиагруппа упала: `log.exception`, но номер всё равно уходит текстом."""
+    monkeypatch.setattr(settings, "cmp_widget_group", False)
+    message = FakeMessage(env.calls, chat_type="group")
+
+    async def boom(media, **kwargs):
+        raise RuntimeError("media group rejected")
+
+    message.answer_media_group = boom
+
+    with caplog.at_level(logging.INFO, logger=service.log.name):
+        await service.compare_images(message, PNG_A, PNG_B)
+
+    assert len(message.answers) == 1
+    assert message.answers[0].count(f"#{CMP_ID}") == 1
+    errors = [record for record in caplog.records if record.exc_info]
+    assert len(errors) == 1, caplog.text
+    assert "Не удалось отправить альбом" in errors[0].getMessage()
+    assert errors[0].levelno == logging.ERROR
+
+
+# ---------------------------------------------------------------- resend_cached
+
+
+def _cached(owner_id: int = USER_ID) -> Cached:
+    """Сохранённое сравнение для `/cmp #номер`; картинки — настоящие байты."""
+    return Cached(
+        id=CMP_ID,
+        owner_id=owner_id,
+        created_at=0.0,
+        width=430,
+        quality=34,
+        labels=("До", "После"),
+        zlib_bytes=3000,
+        image_a=PNG_A,
+        image_b=PNG_B,
+        aspect="3:2",
+    )
+
+
+async def test_resend_cached_in_group_sends_album_and_never_widget(env, monkeypatch):
+    monkeypatch.setattr(settings, "cmp_widget_group", False)
+    monkeypatch.setattr(settings, "cmp_share_by_id", False)
+    env.store.cached = _cached()
+    message = FakeMessage(env.calls, chat_type="group")
+
+    await service.resend_cached(message, CMP_ID)
+
+    assert ("store.get", CMP_ID, USER_ID) in env.calls
+    assert not _widgets(env.calls)
+    assert len(message.media_groups) == 1
+    assert [
+        item.media.filename for item in message.media_groups[0]
+    ] == ["before.jpg", "after.jpg"]
+    assert len(message.answers) == 1
+    assert message.answers[0].startswith("@test_bot #482913")
+    assert message.answers[0].count(f"#{CMP_ID}") == 1
+
+
+async def test_resend_cached_in_private_still_sends_widget(env, monkeypatch, caplog):
+    """Личка не изменилась: номер из кеша снова даёт бабл через `sendWidget`."""
+    monkeypatch.setattr(settings, "cmp_widget_group", False)
+    monkeypatch.setattr(settings, "cmp_share_by_id", False)
+    env.store.cached = _cached()
+    message = FakeMessage(env.calls, chat_type="private")
+
+    with caplog.at_level(logging.INFO, logger=service.log.name):
+        await service.resend_cached(message, CMP_ID)
+
+    widgets = _widgets(env.calls)
+    assert len(widgets) == 1
+    assert widgets[0][3] == "@test_bot #482913"
+    assert message.media_groups == [] and message.answers == []
+    assert "бабл отправлен из кеша" in caplog.text
+
+
+async def test_resend_cached_widget_rejected_falls_back_to_album(env, monkeypatch, caplog):
+    """Личка, виджет отклонён: WARNING с номером, JPEG-альбом и номер текстом.
+
+    Тот же фолбэк, что и у свежего сравнения, но через `/cmp #номер`: исключение
+    `WidgetAPIError` не должно выходить наружу.
+    """
+    monkeypatch.setattr(settings, "cmp_widget_group", False)
+    monkeypatch.setattr(settings, "cmp_share_by_id", False)
+    env.store.cached = _cached()
+    env.api.error = WidgetAPIError(400, "INPUT_MEDIA_WIDGET_NOT_ALLOWED")
+    message = FakeMessage(env.calls, chat_type="private")
+
+    with caplog.at_level(logging.WARNING, logger=service.log.name):
+        await service.resend_cached(message, CMP_ID)
+
+    warnings = [
+        record.getMessage()
+        for record in caplog.records
+        if record.levelno == logging.WARNING
+    ]
+    assert len(warnings) == 1, caplog.text
+    assert f"cmp=#{CMP_ID}" in warnings[0]
+
+    assert len(message.media_groups) == 1
+    media = message.media_groups[0]
+    assert all(isinstance(item, InputMediaPhoto) for item in media)
+    assert [item.media.filename for item in media] == ["before.jpg", "after.jpg"]
+    assert all(item.media.data[:2] == b"\xff\xd8" for item in media)
+
+    assert len(message.answers) == 1
+    assert message.answers[0].count(f"#{CMP_ID}") == 1
+    assert "Клиент не принял виджет" in message.answers[0]
+
+
+async def test_resend_cached_foreign_number_is_missing_when_sharing_disabled(
+    env, monkeypatch, caplog
+):
+    monkeypatch.setattr(settings, "cmp_share_by_id", False)
+    env.store.cached = _cached(owner_id=OTHER_USER_ID)
+    message = FakeMessage(env.calls, chat_type="private")
+
+    with caplog.at_level(logging.INFO, logger=service.log.name):
+        await service.resend_cached(message, CMP_ID)
+
+    assert message.answers == [service.MISSING_ID_TEXT.format(id=CMP_ID)]
+    assert not _widgets(env.calls) and message.media_groups == []
+    assert f"cmp #{CMP_ID}: не найден" in caplog.text
+    assert f"user={USER_ID}" in caplog.text
+    assert f"owner={USER_ID}" in caplog.text
+    assert "share_by_id=False" in caplog.text
+
+
+async def test_resend_cached_unknown_number_is_missing(env, caplog):
+    env.store.cached = None
+    message = FakeMessage(env.calls, chat_type="group")
+
+    with caplog.at_level(logging.INFO, logger=service.log.name):
+        await service.resend_cached(message, "999999")
+
+    assert message.answers == [service.MISSING_ID_TEXT.format(id="999999")]
+    assert not _widgets(env.calls) and message.media_groups == []
+    assert "cmp #999999: не найден" in caplog.text
+
+
+# ------------------------------------------------------------------- album logs
+
+
+class _SendMessageLike:
+    """Двойник `aiogram.methods.SendMessage`: не корутина, но `await` работает.
+
+    Ровно на таком объекте падает `asyncio.create_task(...)` в aiogram 3.31:
+    поэтому подсказка обязана идти через `_send_text`.
+    """
+
+    def __await__(self):
+        return asyncio.sleep(0).__await__()
+
+
+class SyncAnswerMessage(FakeMessage):
+    """`answer()` — обычный метод (как в aiogram), возвращает awaitable."""
+
+    def answer(self, text, **kwargs):
+        self.answers.append(text)
+        self.calls.append(("answer", text))
+        return _SendMessageLike()
+
+
+async def test_flush_single_image_sends_hint_through_coroutine_wrapper(env, caplog):
+    """Одна картинка в буфере: `create_task` получает корутину, а не `SendMessage`."""
+    message = SyncAnswerMessage(env.calls, chat_type="group")
+    service._albums[(CHAT_ID, "one-photo")] = service.Album(
+        chat_id=CHAT_ID, message=message, images=[PNG_A]
+    )
+
+    with caplog.at_level(logging.INFO, logger=service.log.name):
+        service._flush((CHAT_ID, "one-photo"))  # TypeError здесь = регрессия
+        await settle()
+
+    assert len(message.answers) == 1
+    assert message.answers[0] == service._need_two_text(message)
+    assert "privacy mode" in message.answers[0]
+    assert "подсказку" in caplog.text
+
+
+async def test_album_start_and_each_image_are_logged_at_info(env, monkeypatch, caplog):
+    """`LOG_LEVEL=INFO` достаточно, чтобы увидеть старт альбома и оба фото."""
+
+    async def fake_download_photo(message, file_id):
+        return PNG_A if file_id == "photo-1" else PNG_B
+
+    monkeypatch.setattr("bot.respond.download_photo", fake_download_photo)
+
+    with caplog.at_level(logging.INFO, logger=service.log.name):
+        first = photo_message(
+            env.calls, "photo-1", caption="/cmp", media_group_id="log-1", message_id=10
+        )
+        await compare_handlers.on_cmp(first)
+        second = photo_message(
+            env.calls, "photo-2", media_group_id="log-1", message_id=11
+        )
+        await compare_handlers.on_album_image(second)
+        await settle()
+
+    records = [rec for rec in caplog.records if rec.name == service.log.name]
+    starts = [rec.getMessage() for rec in records if "старт альбома" in rec.getMessage()]
+    assert len(starts) == 1, caplog.text
+    assert f"chat={CHAT_ID}" in starts[0]
+    assert "key=log-1" in starts[0]
+    assert "вторую картинку" in starts[0]
+
+    added = [rec.getMessage() for rec in records if "картинка в альбоме" in rec.getMessage()]
+    assert len(added) == 2, caplog.text
+    assert "buffer=1" in added[0] and "buffer=2" in added[1]
+    assert f"size={len(PNG_A)}" in added[0] and f"size={len(PNG_B)}" in added[1]
+
+    assert all(
+        rec.levelno == logging.INFO
+        for rec in records
+        if rec.getMessage() in starts + added
+    )
+    # Никаких дублей WARNING про картинки/размер на успешном пути.
+    assert not [rec for rec in records if rec.levelno >= logging.WARNING]
 
 
 # ------------------------------------------------------------ old API removed

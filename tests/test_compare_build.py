@@ -84,7 +84,7 @@ def _webp_size(blob: bytes) -> tuple[int, int]:
 # --------------------------------------------------------------------------- render
 
 
-def test_render_fills_every_placeholder():
+def test_render_fills_placeholders_and_custom_aspect():
     html = render("data:a", "data:b", labels=LABELS, title="Мой бабл", hint="Тяни")
 
     # `}}` встречается в минифицированном JS, поэтому ищем именно плейсхолдеры.
@@ -95,13 +95,11 @@ def test_render_fills_every_placeholder():
     assert "Тяни" in html
     assert "data:a" in html and "data:b" in html
 
-
-def test_render_uses_custom_aspect():
     html = render("a", "b", labels=LABELS, title=TITLE, hint=HINT, aspect="4:3")
     assert "aspect-ratio: 4 / 3" in html
 
 
-def test_render_bakes_layer_size_attributes():
+def test_render_bakes_size_attributes_only_with_width():
     html = render("a", "b", labels=LABELS, title=TITLE, hint=HINT, aspect="4:3", width=300)
 
     sizes = _layer_sizes(html)
@@ -110,10 +108,7 @@ def test_render_bakes_layer_size_attributes():
     assert 'src="a" width="300" height="225"' in html
     assert 'src="b" width="300" height="225"' in html
 
-
-def test_render_without_width_has_no_size_attributes():
     html = render("a", "b", labels=LABELS, title=TITLE, hint=HINT)
-
     assert "{{SIZE}}" not in html
     assert 'width="' not in html and 'height="' not in html
 
@@ -131,7 +126,7 @@ def test_render_height_matches_webp_size_for_every_aspect():
         assert expected[1] == _height_for(203, aspect)
 
 
-def test_aspect_pair_accepts_integers_and_fractions():
+def test_render_aspect_pair_accepts_integers_and_fractions():
     assert _aspect_pair("3:2") == (3, 2)
     assert _aspect_pair("4:3") == (4, 3)
     assert _aspect_pair("16:9") == (16, 9)
@@ -144,48 +139,35 @@ def test_aspect_pair_accepts_integers_and_fractions():
         _aspect_pair((0, 2))
 
 
-def test_render_keeps_css_braces():
-    """str.format сломал бы CSS — проверяем, что фигурные скобки на месте."""
+def test_render_keeps_css_braces_and_escapes_labels():
+    """str.format сломал бы CSS; подписи и заголовок экранируются."""
     html = render("a", "b", labels=LABELS, title=TITLE, hint=HINT)
     assert "<style>" in html and "</style>" in html
     assert "body{margin:0" in html
     assert "#c{position:relative" in html
 
-
-def test_render_escapes_labels():
     html = render("a", "b", labels=("<A>", '&"B"'), title="T&T", hint="h")
     assert "&lt;A&gt;" in html
     assert "<title>T&amp;T</title>" in html
     assert "&quot;B&quot;" in html
 
 
-def test_render_cached_matches_render():
+def test_render_cached_matches_render_and_bakes_size():
     url_a, blob_a, _ = to_webp(_blue(), 300, 30)
     url_b, blob_b, _ = to_webp(_orange(), 300, 30)
+    _, small_a, _ = to_webp(_blue(), 150, 30)
+    _, small_b, _ = to_webp(_orange(), 150, 30)
 
     fresh = render(url_a, url_b, labels=LABELS, title=TITLE, hint=HINT)
     cached = render_cached(
         image_a=blob_a, image_b=blob_b, labels=LABELS, title=TITLE, hint=HINT
     )
-
     assert cached == fresh
     assert "{{" not in cached
 
-
-def test_render_cached_defaults_to_3_2_and_honours_aspect():
-    _, blob_a, _ = to_webp(_blue(), 150, 30)
-    _, blob_b, _ = to_webp(_orange(), 150, 30)
-    base = dict(image_a=blob_a, image_b=blob_b, labels=LABELS, title=TITLE, hint=HINT)
-
+    base = dict(image_a=small_a, image_b=small_b, labels=LABELS, title=TITLE, hint=HINT)
     assert "aspect-ratio: 3 / 2" in render_cached(**base)
     assert "aspect-ratio: 4 / 3" in render_cached(**base, aspect="4:3")
-
-
-def test_render_cached_bakes_size_only_when_width_given():
-    _, blob_a, _ = to_webp(_blue(), 150, 30)
-    _, blob_b, _ = to_webp(_orange(), 150, 30)
-    base = dict(image_a=blob_a, image_b=blob_b, labels=LABELS, title=TITLE, hint=HINT)
-
     assert _layer_sizes(render_cached(**base)) == []
     assert _layer_sizes(render_cached(**base, width=150)) == [(150, 100), (150, 100)]
     assert _layer_sizes(render_cached(**base, aspect="16:9", width=150)) == [
@@ -202,27 +184,23 @@ def test_zsize_matches_zlib_level_9():
 # ------------------------------------------------------------------- шаблон
 
 
-def test_template_has_no_division_or_pn_variable():
-    """Якорь: ширина клипа не делится на позицию и не зависит от `--pn`."""
+def test_template_layers_and_clip_geometry():
+    """Якоря вёрстки: клип от левого края, `--p` в процентах, слои во весь бабл."""
     template = _template_text()
 
+    # Ширина клипа не делится на позицию и не зависит от `--pn`.
     assert "calc(100% /" not in template
     assert "var(--pn)" not in template
     assert "--pn" not in template
 
-
-def test_template_keeps_clip_anchored_to_left_edge():
-    template = _template_text()
     clip = _rule(template, "#k")
     image = _rule(template, "#k img")
-
     # Верхний слой: без `right`/`inset`, иначе раскладка переопределена.
     for declaration in ("left:0", "top:0", "bottom:0"):
         assert declaration in clip
     assert "right:" not in clip
     assert "inset" not in clip
     assert "calc(var(--p)*1%)" in clip
-
     # Картинка внутри клипа: размеры задаются атрибутами и JS в px, не из пропорций.
     for declaration in ("left:0", "top:0", "height:100%", "max-width:none"):
         assert declaration in image
@@ -230,6 +208,20 @@ def test_template_keeps_clip_anchored_to_left_edge():
     assert "object-fit" not in image
     assert "right:" not in image
     assert "inset" not in image
+
+    base = _rule(template, "#ib")
+    for declaration in ("left:0", "top:0", "width:100%", "height:100%", "object-fit:cover"):
+        assert declaration in base
+
+    bubble = _rule(template, "#c")
+    assert "aspect-ratio: {{AR}}" in bubble
+    assert "touch-action: pan-y" in bubble
+    assert "overflow:hidden" in bubble
+
+    # `--p` хранится в процентах: иначе `calc(var(--p)*1%)` даёт 0.5% вместо 50%.
+    assert "--p:50" in bubble
+    assert "c.style.setProperty('--p',p*100)" in template
+    assert "calc(var(--p)*1%)" in _rule(template, "#b")
 
 
 def test_template_bakes_size_and_syncs_layers_from_js():
@@ -281,32 +273,6 @@ def _open_blocks(js: str, position: int) -> list[str]:
             stack.pop()
         index += 1
     return stack
-
-
-def test_template_bottom_layer_covers_bubble():
-    template = _template_text()
-    base = _rule(template, "#ib")
-
-    for declaration in ("left:0", "top:0", "width:100%", "height:100%", "object-fit:cover"):
-        assert declaration in base
-
-
-def test_template_bubble_keeps_aspect_and_vertical_scroll():
-    bubble = _rule(_template_text(), "#c")
-
-    assert "aspect-ratio: {{AR}}" in bubble
-    assert "touch-action: pan-y" in bubble
-    assert "overflow:hidden" in bubble
-
-
-def test_template_position_variable_is_percent():
-    """`--p` хранится в процентах: иначе `calc(var(--p)*1%)` даёт 0.5% вместо 50%."""
-    template = _template_text()
-
-    assert "--p:50" in _rule(template, "#c")
-    assert "c.style.setProperty('--p',p*100)" in template
-    assert "calc(var(--p)*1%)" in _rule(template, "#k")
-    assert "calc(var(--p)*1%)" in _rule(template, "#b")
 
 
 def test_template_fits_minified_budget():
@@ -461,15 +427,13 @@ def test_build_is_bounded_by_encode_limit(monkeypatch):
     assert {row.width for row in report} == {800}
 
 
-def test_widths_end_exactly_at_min_width():
+def test_widths_end_at_min_and_qualities_step_by_four():
     widths = _widths(430, 160)
     assert widths[0] == 430
     assert widths[-1] == 160
     assert widths == sorted(widths, reverse=True)
     assert len(set(widths)) == len(widths)
 
-
-def test_qualities_step_by_four():
     assert _qualities(34, 16) == [34, 30, 26, 22, 18, 16]
     assert _qualities(20, 16) == [20, 16]
     assert _qualities(16, 16) == [16]
@@ -488,7 +452,7 @@ def workdir():
         shutil.rmtree(path, ignore_errors=True)
 
 
-def test_cli_demo_writes_html_and_check_passes(workdir, capsys):
+def test_cli_demo_report_and_file_mode(workdir, capsys):
     target = workdir / "nested" / "cmp-demo.html"
 
     assert main(["--demo", "--out", str(target)]) == 0
@@ -501,34 +465,14 @@ def test_cli_demo_writes_html_and_check_passes(workdir, capsys):
     check_out = capsys.readouterr().out
     assert "raw=" in check_out and "zlib=" in check_out
 
-
-def test_cli_report_prints_table_winner_and_time(workdir, capsys):
-    target = workdir / "report.html"
-
-    assert main(["--demo", "--out", str(target), "--report"]) == 0
+    report_target = workdir / "report.html"
+    assert main(["--demo", "--out", str(report_target), "--report"]) == 0
     out = capsys.readouterr().out
-
     assert "width" in out and "err_a" in out and "err_b" in out
     assert "ВЫБРАН:" in out
     assert "время сборки:" in out
-    assert target.is_file()
-    assert main(["--check", str(target)]) == 0
-
-
-def test_cli_check_fails_on_oversize_html(workdir):
-    oversized = workdir / "big.html"
-    oversized.write_text("x" * (RAW_LIMIT + 1), encoding="utf-8")
-
-    assert main(["--check", str(oversized)]) == 1
-
-
-def test_cli_requires_arguments(capsys):
-    assert main([]) == 2
-    assert "--demo" in capsys.readouterr().err
-
-
-def test_cli_file_mode(workdir, capsys):
-    from io import BytesIO
+    assert report_target.is_file()
+    assert main(["--check", str(report_target)]) == 0
 
     def save(img: Image.Image, name: str):
         path = workdir / name
@@ -539,12 +483,22 @@ def test_cli_file_mode(workdir, capsys):
 
     a = save(_blue(), "a.png")
     b = save(_orange(), "b.png")
-    out = workdir / "out.html"
+    file_out = workdir / "out.html"
 
-    assert main(["--a", str(a), "--b", str(b), "--out", str(out), "--report"]) == 0
+    assert main(["--a", str(a), "--b", str(b), "--out", str(file_out), "--report"]) == 0
     out_text = capsys.readouterr().out
     assert "width=" in out_text and "ВЫБРАН:" in out_text
-    assert main(["--check", str(out)]) == 0
+    assert main(["--check", str(file_out)]) == 0
+
+
+def test_cli_check_fails_on_oversize_and_requires_arguments(workdir, capsys):
+    oversized = workdir / "big.html"
+    oversized.write_text("x" * (RAW_LIMIT + 1), encoding="utf-8")
+
+    assert main(["--check", str(oversized)]) == 1
+
+    assert main([]) == 2
+    assert "--demo" in capsys.readouterr().err
 
 
 def test_cli_reports_bad_image(workdir, capsys):

@@ -202,16 +202,12 @@ def test_render_without_any_font_still_returns_jpeg(monkeypatch):
     assert blob[:2] == b"\xff\xd8"
     assert Image.open(BytesIO(blob)).size == (320, 213)
 
-
-def test_render_tolerates_missing_or_broken_labels(monkeypatch):
-    monkeypatch.setattr(preview, "FONT_CANDIDATES", ())
-
     for labels in (("", ""), (), None):
         blob = preview.render(solid((0, 0, 0)), solid((255, 255, 255)), width=64, labels=labels)
-        assert blob[:2] == b"\xff\xd8"
+        assert blob[:2] == b"\xff\xd8", labels
 
 
-def test_aspect_variants_change_composite_size():
+def test_aspect_variants_and_invalid_input():
     blob = preview.render(solid((9, 9, 9)), solid((200, 200, 200)), width=640, aspect="4:3")
 
     assert Image.open(BytesIO(blob)).size == (640, 480)
@@ -219,8 +215,6 @@ def test_aspect_variants_change_composite_size():
     assert preview.size_for(1000) == (1000, round(1000 * 2 / 3))
     assert preview.size_for(1000, "4:3") == (1000, 750)
 
-
-def test_invalid_width_and_aspect_raise_image_error():
     with pytest.raises(images.ImageError):
         preview.render(solid((0, 0, 0)), solid((0, 0, 0)), width=1)
     with pytest.raises(images.ImageError):

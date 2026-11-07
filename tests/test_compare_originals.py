@@ -84,20 +84,15 @@ def test_save_writes_webp_and_avif_for_both_sides(cache_dir: Path):
     assert webp[:4] == b"RIFF" and webp[8:12] == b"WEBP"
     assert avif[4:8] == b"ftyp" and b"avif" in avif[:32]
 
-
-def test_save_without_avif_support_writes_only_webp(cache_dir: Path, monkeypatch):
-    """Pillow без AVIF: два WebP-файла, AVIF не появляется даже в словаре."""
-    monkeypatch.setattr(originals.features, "check", lambda feature: False)
-
-    paths = originals.save(cache_dir, CMP_ID, picture(), picture(), width=200)
-
-    assert set(paths) == {"a.webp", "b.webp"}
-    assert files(cache_dir) == [f"{CMP_ID}-a.webp", f"{CMP_ID}-b.webp"]
-    assert originals.read(cache_dir, CMP_ID, "a", accept="image/avif")[1] == "webp"
+    # AVIF q60 не толще WebP q80 при той же ширине (в отчёт — фактические байты).
+    originals.save(cache_dir, "112233", picture((800, 600)), picture((800, 600)), width=800)
+    webp_size = (cache_dir / "originals" / "112233-a.webp").stat().st_size
+    avif_size = (cache_dir / "originals" / "112233-a.avif").stat().st_size
+    assert avif_size <= webp_size, f"AVIF {avif_size} Б против WebP {webp_size} Б"
 
 
-def test_avif_failure_warns_and_keeps_webp(cache_dir: Path, monkeypatch, caplog):
-    """Ошибка AVIF-кодировщика: warning в лог, WebP обеих сторон остаётся."""
+def test_avif_absent_or_failing_falls_back_to_webp(cache_dir: Path, monkeypatch, caplog):
+    """Нет AVIF-кодировщика или он упал: warning и только WebP обеих сторон."""
     avif_required()
 
     real_encode = originals._encode
@@ -116,6 +111,13 @@ def test_avif_failure_warns_and_keeps_webp(cache_dir: Path, monkeypatch, caplog)
     assert files(cache_dir) == [f"{CMP_ID}-a.webp", f"{CMP_ID}-b.webp"]
     assert "avif" in caplog.text.lower() and "exploded" in caplog.text
 
+    # Pillow без AVIF: два WebP-файла, AVIF не появляется даже в словаре.
+    monkeypatch.setattr(originals.features, "check", lambda feature: False)
+    paths = originals.save(cache_dir, "445566", picture(), picture(), width=200)
+    assert set(paths) == {"a.webp", "b.webp"}
+    assert files(cache_dir, "445566") == ["445566-a.webp", "445566-b.webp"]
+    assert originals.read(cache_dir, "445566", "a", accept="image/avif")[1] == "webp"
+
 
 def test_saved_width_is_capped_and_never_upscaled(cache_dir: Path):
     """Ширина ≤ `width`; если кроп уже уже — не растягиваем и высота из AR."""
@@ -127,8 +129,11 @@ def test_saved_width_is_capped_and_never_upscaled(cache_dir: Path):
     assert decode(originals.read(cache_dir, "112233", "a")[0]).size == (900, 600)
 
 
-def test_crop_uses_the_same_window_as_the_widget(cache_dir: Path):
-    """Пиксели файла = `images.crop(img, fit_box(img_a, aspect))`, а не полный кадр."""
+def test_crop_uses_the_same_window_as_the_widget_for_both_sides(cache_dir: Path):
+    """Пиксели файла = `images.crop(img, fit_box(img_a, aspect))`, а не полный кадр.
+
+    Окно считается по `img_a` и применяется к `b`, а не подгоняется под каждую.
+    """
     source = banded()
 
     originals.save(cache_dir, CMP_ID, source, source, width=450)
@@ -148,36 +153,22 @@ def test_crop_uses_the_same_window_as_the_widget(cache_dir: Path):
     top_left = saved.getpixel((0, 0))
     assert top_left[2] > 200 and top_left[0] < 60
 
-
-def test_both_sides_use_the_same_crop_window_from_img_a(cache_dir: Path):
-    """Окно считается по `img_a` и применяется к `b`, а не подгоняется под каждую."""
     source_a = picture((1200, 900))
     # У b другой AR и красная полоса сверху: персональный `fit_box` срезал бы её.
     source_b = banded((600, 1200), band=120)
 
-    originals.save(cache_dir, CMP_ID, source_a, source_b, width=600)
+    originals.save(cache_dir, "778899", source_a, source_b, width=600)
 
     window = images.fit_box(source_a, ASPECT)
-    saved_a = decode(originals.read(cache_dir, CMP_ID, "a")[0])
+    saved_a = decode(originals.read(cache_dir, "778899", "a")[0])
     expected_a = images.crop(source_a, window).resize(saved_a.size, Image.LANCZOS)
     assert max(ImageStat.Stat(ImageChops.difference(saved_a, expected_a)).mean) <= 4.0
 
-    saved_b = decode(originals.read(cache_dir, CMP_ID, "b")[0])
+    saved_b = decode(originals.read(cache_dir, "778899", "b")[0])
     cropped_b = images.crop(source_b, window)
     assert saved_b.size == (min(600, cropped_b.width), 400)
     # Окно a (срез ~5.6% сверху) оставляет красную полосу b, персональное — нет.
     assert saved_b.getpixel((0, 0))[0] > 150
-
-
-def test_avif_is_not_larger_than_webp(cache_dir: Path):
-    """AVIF q60 не толще WebP q80 при той же ширине (в отчёт — фактические байты)."""
-    avif_required()
-
-    originals.save(cache_dir, CMP_ID, picture(), picture(), width=800)
-
-    webp = (cache_dir / "originals" / f"{CMP_ID}-a.webp").stat().st_size
-    avif = (cache_dir / "originals" / f"{CMP_ID}-a.avif").stat().st_size
-    assert avif <= webp, f"AVIF {avif} Б против WebP {webp} Б"
 
 
 # ------------------------------------------------------------------------ read

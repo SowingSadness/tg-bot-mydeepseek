@@ -1,11 +1,15 @@
-"""Хендлеры `/cmp`: ссылки, альбом из двух картинок или картинка в ответе.
+"""Хендлеры `/cmp`: ссылки, альбом из двух картинок, картинка в ответе или номер.
 
-Роутер подключается **раньше** `private`: там есть catch-all
-`F.text.startswith("/")`, который иначе съел бы `/cmp`, а фото и документы
-уходят в DeepSeek. Здесь картинки перехватываются только в двух случаях:
-у сообщения есть подпись/текст `/cmp` или это продолжение нашего альбома
-(фильтр `AlbumContinuation`). Третье фото уже сравнённого альбома проходит
-фильтр, но сервис молча дропает его: в DeepSeek оно тоже не попадает.
+Роутер обслуживает личные чаты и группы (`/cmp`, `/cmp@bot`, `/cmp #номер`);
+каналы исключены — там нет ни альбомов от пользователей, ни нормальных ответов
+на сообщения. Подключается **раньше** `private` и `group`: catch-all
+`F.text.startswith("/")` в `private` и обработчик `F.text` в `group` иначе съели
+бы `/cmp`, а фото и документы ушли бы в DeepSeek.
+
+Картинки перехватываются только в двух случаях: у сообщения есть подпись/текст
+`/cmp` или это продолжение нашего альбома (фильтр `AlbumContinuation`). Третье
+фото уже сравнённого альбома проходит фильтр, но сервис молча дропает его:
+в DeepSeek оно тоже не попадает.
 """
 
 from __future__ import annotations
@@ -26,9 +30,15 @@ from ..respond import deny, is_allowed
 log = logging.getLogger(__name__)
 
 router = Router(name="compare")
-router.message.filter(F.chat.type == ChatType.PRIVATE)
+
+#: Где работает `/cmp`: личка и группы. Каналы не слушаем: там нет альбомов
+#: от пользователей и нормальных ответов на сообщения.
+CMP_CHATS = frozenset({ChatType.PRIVATE, ChatType.GROUP, ChatType.SUPERGROUP})
+router.message.filter(F.chat.type.in_(CMP_CHATS))
 
 _URL_RE = re.compile(r"https?://\S+")
+# Первый `#номер` сравнения: три и более цифр (`/cmp #337326`).
+_ID_RE = re.compile(r"#(\d{3,})")
 # Хвостовая пунктуация из текста сообщения не часть ссылки.
 _URL_TAIL = ".,;"
 
@@ -80,11 +90,31 @@ async def on_cmp(message: Message) -> None:
     urls = [url for url in urls if url]
     reply = _reply_image(message)
     own_image = bool(getattr(message, "photo", None) or getattr(message, "document", None))
+    chat_type = getattr(message.chat.type, "value", message.chat.type)
+
+    # URL из текста не логируем: в них бывает `startapp`-токен. Длины и флаги
+    # достаточно, чтобы понять, какая ветка выбрана и почему.
+    log.info(
+        "cmp: вход chat=%s/%s user=%s text=%d urls=%d own_image=%s reply=%s",
+        message.chat.id,
+        chat_type,
+        user.id,
+        len(text),
+        len(urls),
+        own_image,
+        reply is not None,
+    )
 
     try:
         # Две ссылки — сразу сравниваем, даже если в сообщении/ответе есть картинка.
         if len(urls) >= 2:
             await service.compare_urls(message, urls[:2])
+            return
+
+        # Номер из кеша: `/cmp #337326` — раньше картинок и ответов (но после двух ссылок).
+        match = _ID_RE.search(text)
+        if match is not None:
+            await service.resend_cached(message, match.group(1))
             return
 
         if own_image:
@@ -110,7 +140,8 @@ async def on_cmp(message: Message) -> None:
         return
 
     # Ни двух ссылок, ни картинки с подписью: подсказываем формат, состояние не держим.
-    await message.answer(service.NEED_TWO_TEXT)
+    # В группе подсказка дополняется абзацем про privacy mode (`_need_two_text`).
+    await message.answer(service._need_two_text(message))
 
 
 @router.message(F.photo | F.document, AlbumContinuation())
@@ -124,4 +155,4 @@ async def on_album_image(message: Message) -> None:
     await service.add_album_image(message)
 
 
-__all__ = ["AlbumContinuation", "on_album_image", "on_cmp", "router"]
+__all__ = ["AlbumContinuation", "CMP_CHATS", "on_album_image", "on_cmp", "router"]

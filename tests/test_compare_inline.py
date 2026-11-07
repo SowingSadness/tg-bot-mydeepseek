@@ -141,16 +141,11 @@ def _results(api: FakeAPI) -> list[dict]:
 # ---------------------------------------------------------------------- ID_RE
 
 
-@pytest.mark.parametrize("text", ["#482913", "#12345678"])
-def test_id_re_accepts_numbers(text: str):
-    assert compare_inline.ID_RE.fullmatch(text) is not None
-
-
-@pytest.mark.parametrize(
-    "text", ["#python", "#48291", "482913", "#123456789", "", "#48291a3"]
-)
-def test_id_re_rejects_everything_else(text: str):
-    assert compare_inline.ID_RE.fullmatch(text) is None
+def test_id_re_matches_only_six_to_eight_digit_hashes():
+    for text in ["#482913", "#12345678"]:
+        assert compare_inline.ID_RE.fullmatch(text) is not None, text
+    for text in ["#python", "#48291", "482913", "#123456789", "", "#48291a3"]:
+        assert compare_inline.ID_RE.fullmatch(text) is None, text
 
 
 # ------------------------------------------------------- multi-result payload
@@ -245,23 +240,22 @@ async def test_main_app_link_when_short_name_is_empty():
     assert open_result["reply_markup"] == photo["reply_markup"]
 
 
-@pytest.mark.parametrize("preview_file_id", [None, ""])
 async def test_photo_result_absent_without_preview_file_id(
-    preview_file_id: str | None,
     monkeypatch: pytest.MonkeyPatch,
 ):
     monkeypatch.setattr(settings, "cmp_webapp_short_name", SHORT_NAME)
-    store = FakeStore(cached(preview_file_id=preview_file_id))
-    api = FakeAPI()
-    configure(store, api)
+    for preview_file_id in (None, ""):
+        store = FakeStore(cached(preview_file_id=preview_file_id))
+        api = FakeAPI()
+        configure(store, api)
 
-    assert await compare_inline.try_answer(make_query(f"#{CMP_ID}")) is True
+        assert await compare_inline.try_answer(make_query(f"#{CMP_ID}")) is True
 
-    results = _results(api)
-    # Старая запись без превью: остаётся article с кнопкой, текстового нет.
-    assert [result["id"] for result in results] == [f"{CMP_ID}-open"]
-    assert all("photo_file_id" not in result for result in results)
-    _assert_short_app_token(_button_url(results[0]))
+        results = _results(api)
+        # Старая запись без превью: остаётся article с кнопкой, текстового нет.
+        assert [result["id"] for result in results] == [f"{CMP_ID}-open"]
+        assert all("photo_file_id" not in result for result in results)
+        _assert_short_app_token(_button_url(results[0]))
 
 
 async def test_only_text_when_bot_username_is_missing(monkeypatch: pytest.MonkeyPatch):
@@ -377,25 +371,8 @@ async def test_refused_widget_is_retried_without_it(monkeypatch: pytest.MonkeyPa
     assert all("html" not in (result.get("input_message_content") or {}) for result in results)
 
 
-
-async def test_foreign_comparison_without_share_is_missing():
-    store = FakeStore(cached(owner_id=OTHER_USER_ID))
-    api = FakeAPI()
-    configure(store, api)
-
-    assert await compare_inline.try_answer(make_query(f"#{CMP_ID}")) is True
-
-    # owner_id передан: чужую запись кеш не отдаёт.
-    assert store.calls == [(CMP_ID, USER_ID)]
-    article = _article(api)
-    assert article["id"] == "cmp-missing"
-    assert article["title"] == f"Сравнение #{CMP_ID} не найдено"
-    assert "Номер не найден" in article["description"]
-    assert api.calls[0]["is_personal"] is True
-
-
-async def test_foreign_number_without_share_never_leaks_photo(monkeypatch: pytest.MonkeyPatch):
-    """Чужое сравнение с превью не должно отдавать file_id при CMP_SHARE_BY_ID=false."""
+async def test_foreign_comparison_without_share_is_missing(monkeypatch: pytest.MonkeyPatch):
+    """Чужое сравнение (даже с превью) не отдаёт ни file_id, ни кнопку."""
     monkeypatch.setattr(settings, "cmp_webapp_short_name", SHORT_NAME)
     store = FakeStore(cached(owner_id=OTHER_USER_ID, preview_file_id=PREVIEW_FILE_ID))
     api = FakeAPI()
@@ -403,11 +380,17 @@ async def test_foreign_number_without_share_never_leaks_photo(monkeypatch: pytes
 
     assert await compare_inline.try_answer(make_query(f"#{CMP_ID}")) is True
 
+    # owner_id передан: чужую запись кеш не отдаёт.
     assert store.calls == [(CMP_ID, USER_ID)]
     results = _results(api)
     assert [result["id"] for result in results] == ["cmp-missing"]
     assert all("photo_file_id" not in result for result in results)
     assert all("reply_markup" not in result for result in results)
+
+    article = results[0]
+    assert article["title"] == f"Сравнение #{CMP_ID} не найдено"
+    assert "Номер не найден" in article["description"]
+    assert api.calls[0]["is_personal"] is True
 
 
 async def test_share_by_id_finds_foreign_comparison(monkeypatch: pytest.MonkeyPatch):
@@ -439,66 +422,58 @@ async def test_unknown_number_returns_missing_hint():
 # --------------------------------------------------------------- short numbers
 
 
-@pytest.mark.parametrize("text", ["#", "#12", "#12345"])
-async def test_short_number_returns_input_hint(text: str):
-    store = FakeStore()
-    api = FakeAPI()
-    configure(store, api)
+async def test_short_number_returns_input_hint():
+    for text in ("#", "#12", "#12345"):
+        store = FakeStore()
+        api = FakeAPI()
+        configure(store, api)
 
-    assert await compare_inline.try_answer(make_query(text)) is True
+        assert await compare_inline.try_answer(make_query(text)) is True
 
-    article = _article(api)
-    assert article["title"] == "Введите номер сравнения"
-    message_text = article["input_message_content"]["message_text"]
-    assert "Например: #482913" in message_text
-    assert api.calls[0]["cache_time"] == 0
-    assert api.calls[0]["is_personal"] is True
-    assert store.calls == []
+        article = _article(api)
+        assert article["title"] == "Введите номер сравнения", text
+        message_text = article["input_message_content"]["message_text"]
+        assert "Например: #482913" in message_text
+        assert api.calls[0]["cache_time"] == 0
+        assert api.calls[0]["is_personal"] is True
+        assert store.calls == []
 
 
 # ------------------------------------------------------------- ordinary queries
 
 
-@pytest.mark.parametrize(
-    "text", ["объясни матрицу", "#python", "#482913abc", "482913", "  объясни  "]
-)
-async def test_ordinary_query_is_not_ours(text: str):
-    store = FakeStore()
-    api = FakeAPI()
-    configure(store, api)
+async def test_ordinary_query_is_not_ours():
+    for text in ("объясни матрицу", "#python", "#482913abc", "482913", "  объясни  "):
+        store = FakeStore()
+        api = FakeAPI()
+        configure(store, api)
 
-    assert await compare_inline.try_answer(make_query(text)) is False
-    assert api.calls == []
-    assert store.calls == []
+        assert await compare_inline.try_answer(make_query(text)) is False, text
+        assert api.calls == []
+        assert store.calls == []
 
 
 # ------------------------------------------------------------- error / no wiring
 
 
-async def test_widget_api_error_is_swallowed():
+async def test_widget_api_errors_are_swallowed(monkeypatch: pytest.MonkeyPatch):
+    """Протухший query ID не повод уходить в DeepSeek, падать или терять номер."""
+    monkeypatch.setattr(settings, "cmp_webapp_short_name", SHORT_NAME)
+
     api = FakeAPI(error=WidgetAPIError(400, "QUERY_ID_INVALID"))
     configure(FakeStore(cached()), api)
-
     assert await compare_inline.try_answer(make_query(f"#{CMP_ID}")) is True
 
-
-async def test_widget_api_error_does_not_break_multi_result_answer(monkeypatch: pytest.MonkeyPatch):
-    monkeypatch.setattr(settings, "cmp_webapp_short_name", SHORT_NAME)
     api = FakeAPI(error=WidgetAPIError(400, "QUERY_ID_INVALID"))
     configure(FakeStore(cached(preview_file_id=PREVIEW_FILE_ID)), api)
-
-    # Протухший query ID — не повод уходить в DeepSeek и не повод падать.
     assert await compare_inline.try_answer(make_query(f"#{CMP_ID}")) is True
     assert [result["id"] for result in _results(api)] == [
         f"{CMP_ID}-photo",
         f"{CMP_ID}-open",
     ]
 
-
-async def test_widget_api_error_on_unknown_number_still_answers_missing_hint():
     api = FakeAPI(error=WidgetAPIError(400, "QUERY_ID_INVALID"))
     configure(FakeStore(), api)
-
     assert await compare_inline.try_answer(make_query("#999999")) is True
     assert _article(api)["id"] == "cmp-missing"
 

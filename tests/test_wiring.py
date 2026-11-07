@@ -138,8 +138,8 @@ def _records(caplog, level: int) -> list[logging.LogRecord]:
     return [record for record in caplog.records if record.levelno == level]
 
 
-async def test_update_middleware_logs_compact_info(caplog) -> None:
-    """INFO — одна компактная строка: контекст и текст, без `file_id`."""
+async def test_update_middleware_logs_compact_info_and_verbose_debug(caplog) -> None:
+    """INFO — одна компактная строка; DEBUG дополнительно печатает медиа-детали."""
     middleware = _middleware()
     seen: list[tuple] = []
 
@@ -163,14 +163,7 @@ async def test_update_middleware_logs_compact_info(caplog) -> None:
     assert "file_id" not in line
     assert "\n" not in line
 
-
-async def test_update_middleware_logs_verbose_debug(caplog) -> None:
-    """DEBUG дополнительно печатает `file_id`, размер и `media_group_id`."""
-    middleware = _middleware()
-
-    async def handler(event, data):  # noqa: ANN001
-        return "handled"
-
+    caplog.clear()
     photo = SimpleNamespace(
         file_id="file-photo", width=100, height=80, file_size=12345
     )
@@ -193,8 +186,8 @@ async def test_update_middleware_logs_verbose_debug(caplog) -> None:
     assert "\n" not in info[0].getMessage()
 
 
-async def test_update_middleware_warns_about_slow_update(caplog, monkeypatch) -> None:
-    """Апдейт дольше 3 c — `WARNING update <id>: slow <N>s`, без текста сообщения."""
+async def test_update_middleware_warns_only_about_slow_update(caplog, monkeypatch) -> None:
+    """Апдейт дольше 3 c — `WARNING update <id>: slow <N>s`; быстрый — молча."""
     middleware = _middleware()
     ticks = iter([100.0, 104.2])
     monkeypatch.setattr(main_module.time, "perf_counter", lambda: next(ticks))
@@ -209,16 +202,9 @@ async def test_update_middleware_warns_about_slow_update(caplog, monkeypatch) ->
     assert [record.getMessage() for record in warnings] == ["update 5: slow 4.2s"]
     assert "привет" not in caplog.text
 
-
-async def test_update_middleware_fast_update_is_not_slow(caplog, monkeypatch) -> None:
-    """Быстрый апдейт под порог 3 c не даёт WARNING."""
-    middleware = _middleware()
+    caplog.clear()
     ticks = iter([100.0, 102.9])
     monkeypatch.setattr(main_module.time, "perf_counter", lambda: next(ticks))
-
-    async def handler(event, data):  # noqa: ANN001
-        return "handled"
-
     with caplog.at_level(logging.WARNING, logger=main_module.log.name):
         assert await middleware(handler, _update_event(), {}) == "handled"
 
@@ -281,10 +267,8 @@ async def test_setup_compare_creates_cache_and_configures(tmp_path, monkeypatch)
     await main_module.teardown_compare()
 
 
-async def test_setup_compare_logs_main_mini_app_link(
-    tmp_path, monkeypatch, caplog
-) -> None:
-    """Пустой `CMP_WEBAPP_SHORT_NAME` — Main Mini App, в логе форма без short name."""
+async def test_setup_compare_logs_mini_app_links(tmp_path, monkeypatch, caplog) -> None:
+    """Пустой `CMP_WEBAPP_SHORT_NAME` — Main Mini App; заданный — ссылка с `/<short>`."""
     monkeypatch.setattr(settings, "cmp_cache_dir", tmp_path / "cmp")
     monkeypatch.setattr(settings, "cmp_webapp_short_name", "")
 
@@ -296,12 +280,8 @@ async def test_setup_compare_logs_main_mini_app_link(
     finally:
         await main_module.teardown_compare()
 
-
-async def test_setup_compare_logs_short_name_link(tmp_path, monkeypatch, caplog) -> None:
-    """Заданный `CMP_WEBAPP_SHORT_NAME` — ссылка с `/<short>` и без пометки Main Mini App."""
-    monkeypatch.setattr(settings, "cmp_cache_dir", tmp_path / "cmp")
+    caplog.clear()
     monkeypatch.setattr(settings, "cmp_webapp_short_name", "cmpapp")
-
     with caplog.at_level(logging.INFO, logger=main_module.log.name):
         await main_module.setup_compare()
     try:
@@ -345,12 +325,15 @@ async def test_setup_compare_purge_removes_originals(tmp_path, monkeypatch) -> N
         await main_module.teardown_compare()
 
 
-async def test_setup_webapp_disabled_when_port_zero(monkeypatch) -> None:
-    """`CMP_WEBAPP_PORT=0` — сервер не поднимается, поведение бота прежнее."""
+async def test_setup_webapp_disabled_and_teardown_safe(monkeypatch) -> None:
+    """`CMP_WEBAPP_PORT=0` — сервер не поднимается; teardown безопасен без setup."""
     monkeypatch.setattr(settings, "cmp_webapp_port", 0)
     assert await main_module.setup_webapp() is None
     # Гашение `None` (сервер не стартовал) безопасно.
     await main_module.teardown_webapp(None)
+
+    await main_module.teardown_compare()
+    await main_module.teardown_compare()
 
 
 def _free_port() -> int:
@@ -386,11 +369,6 @@ async def test_setup_webapp_serves_healthz_and_stops(tmp_path, monkeypatch) -> N
         writer.close()
 
 
-async def test_teardown_compare_is_safe_without_setup() -> None:
-    await main_module.teardown_compare()
-    await main_module.teardown_compare()
-
-
 async def test_purge_loop_cancels_cleanly(tmp_path, monkeypatch) -> None:
     monkeypatch.setattr(settings, "cmp_cache_dir", tmp_path / "cmp")
     await main_module.setup_compare()
@@ -423,7 +401,8 @@ async def test_compare_images_uses_real_store(tmp_path) -> None:
         assert chat_id == message.chat.id
         assert caption and "#" in caption
         assert (width, height) == (0, 0)
-        assert any("#" in text for text in message.answers), "номер должен дойти текстом"
+        # Подпись — единственное место с номером: второго сообщения с номером нет.
+        assert message.answers == [], "после бабла не должно быть лишних сообщений"
 
         match = re.search(r"#(\d{%d,8})" % settings.cmp_id_digits, caption)
         assert match, caption

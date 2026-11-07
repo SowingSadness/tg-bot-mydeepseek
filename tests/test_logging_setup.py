@@ -46,11 +46,7 @@ def make_update(message: Message | None = None) -> Update:
     return Update(update_id=1, message=message or make_message())
 
 
-# --------------------------------------------------------------------- redact
-
-
-def test_setup_logging_is_available() -> None:
-    assert callable(setup_logging)
+# ---------------------------------------------------------- setup / redact
 
 
 def test_setup_logging_sets_root_level() -> None:
@@ -61,6 +57,8 @@ def test_setup_logging_sets_root_level() -> None:
     перенастраивает, если хендлеры есть. Так тест повторяет реальный старт бота
     (чистый root) и возвращает прежние хендлеры и уровень в `finally`.
     """
+    assert callable(setup_logging)
+
     root = logging.getLogger()
     original_level = root.level
     original_handlers = root.handlers[:]
@@ -100,112 +98,67 @@ async def test_widget_api_debug_log_hides_html_and_token(caplog) -> None:
     assert token not in logged
 
 
-def test_redact_replaces_configured_token() -> None:
+def test_redact_replaces_tokens_and_shrinks_data_uri() -> None:
+    """Токен бота (свой и чужой) маскируется; длинный base64 схлопывается до `Nchars`."""
     token = settings.telegram_bot_token
     text = f"POST https://api.telegram.org/bot{token}/sendWidget"
     result = redact(text)
     assert token not in result
     assert result == "POST https://api.telegram.org/bot<token>/sendWidget"
 
-
-def test_redact_replaces_foreign_bot_token() -> None:
     foreign = "123456789:" + "A" * 35
     assert foreign not in redact(f"url=/bot{foreign}/getMe")
 
-
-def test_redact_shrinks_long_data_uri() -> None:
     uri = "data:image/webp;base64," + "A" * 1000
-    result = redact(uri)
-    assert result == "data:image/webp;1000chars"
-    assert "AAAA" not in result
+    shrunk = redact(uri)
+    assert shrunk == "data:image/webp;1000chars"
+    assert "AAAA" not in shrunk
 
-
-def test_redact_keeps_short_data_uri() -> None:
-    uri = "data:image/png;base64," + "A" * 20
-    assert redact(uri) == uri
-
-
-def test_redact_handles_empty_value() -> None:
+    short = "data:image/png;base64," + "A" * 20
+    assert redact(short) == short
     assert redact("") == ""
 
 
 # --------------------------------------------------------------------- redact_url
 
 
-def test_redact_url_masks_image_token() -> None:
+def test_redact_url_masks_sensitive_parts_and_keeps_the_rest() -> None:
+    """Прячутся только токен/mini-app данные; прочие параметры и порядок не тронуты."""
     result = redact_url(f"/app/cmp/img/{STARTAPP_TOKEN}/b?v=1")
     assert result == "/app/cmp/img/<token>/b?v=1"
     assert STARTAPP_TOKEN not in result
 
-
-def test_redact_url_masks_init_data_and_path_token() -> None:
-    result = redact_url(
-        f"/api/cmp/{STARTAPP_TOKEN}?init_data=user%3D1%26hash%3Dx"
-    )
+    result = redact_url(f"/api/cmp/{STARTAPP_TOKEN}?init_data=user%3D1%26hash%3Dx")
     assert STARTAPP_TOKEN not in result
     assert "user%3D1" not in result
     assert "init_data=<redacted>" in result
 
-
-def test_redact_url_masks_sensitive_query_keys() -> None:
-    result = redact_url(
-        f"/app/cmp?t={STARTAPP_TOKEN}&v=2&startapp={STARTAPP_TOKEN}#hash=1"
-    )
+    result = redact_url(f"/app/cmp?t={STARTAPP_TOKEN}&v=2&startapp={STARTAPP_TOKEN}#hash=1")
     assert STARTAPP_TOKEN not in result
     assert "t=<redacted>" in result
     assert "startapp=<redacted>" in result
     assert "hash=<redacted>" in result
-    # остальные параметры и порядок не тронуты
     assert result.startswith("/app/cmp?t=<redacted>&v=2&startapp=<redacted>")
 
-
-def test_redact_url_masks_start_param() -> None:
     token = "337326_AbCdEfGhIjKlMnOpQrSt"
     result = redact_url(f"/app/cmp?tgWebAppStartParam={token}")
     assert token not in result
     assert result == "/app/cmp?tgWebAppStartParam=<redacted>"
 
-
-def test_redact_url_masks_start_param_case_insensitive() -> None:
-    token = "337326_AbCdEfGhIjKlMnOpQrSt"
+    # Имя параметра сравнивается без учёта регистра.
     result = redact_url(f"https://t.me/cmpbot?V=1&tgwebappstartparam={token}&v=2")
     assert token not in result
     assert result.startswith("https://t.me/cmpbot?V=1&tgwebappstartparam=<redacted>")
-    # остальные параметры не тронуты
     assert result.endswith("&v=2")
 
-
-def test_start_param_masked_in_redact_url_but_visible_in_request_line() -> None:
-    """Токен виден только в строке запроса мини-аппа (требование заказчика)."""
-    token = "337326_AbCdEfGhIjKlMnOpQrSt"
-    url = f"/app/cmp?tgWebAppStartParam={token}"
-
-    assert redact_url(url) == "/app/cmp?tgWebAppStartParam=<redacted>"
-    assert token not in redact_url(url)
-
-    line = describe_webapp_request("GET", url, 200, 1)
-    assert line == f"200 GET /app/cmp?tgWebAppStartParam={token} — 1 мс"
-    assert token in line
-    assert "<redacted>" not in line
-
-
-def test_redact_url_masks_fragment_webapp_data() -> None:
     result = redact_url("http://h/app/cmp#tgWebAppData=query_id%3D1&tgWebAppVersion=7")
     assert "query_id" not in result
     assert "tgWebAppData=<redacted>" in result
     assert "tgWebAppVersion=7" in result
 
-
-def test_redact_url_keeps_plain_text() -> None:
     assert redact_url("обычный текст") == "обычный текст"
     assert redact_url("") == ""
-
-
-def test_redact_url_handles_none() -> None:
     assert redact_url(None) == ""
-
-
-def test_redact_url_never_raises() -> None:
     for value in (None, "", "/", "?", "/%%%", 42, object()):
         assert isinstance(redact_url(value), str)
 
@@ -213,7 +166,8 @@ def test_redact_url_never_raises() -> None:
 # --------------------------------------------------------------------- webapp
 
 
-def test_describe_webapp_request_exact_format() -> None:
+def test_describe_webapp_request_format_and_token_visibility() -> None:
+    """Строка `<status> <METHOD> <url> — <N> мс[ user=]`: токен виден, `webapp` — нет."""
     result = describe_webapp_request(
         "GET", "/api/cmp/337326_AbCdEfGhIjKlMnOpQrSt", 200, 1.4
     )
@@ -223,23 +177,47 @@ def test_describe_webapp_request_exact_format() -> None:
     assert "ms" not in result
     assert "\n" not in result
 
-
-def test_describe_webapp_request_keeps_startapp_token_visible() -> None:
     result = describe_webapp_request("GET", f"/api/cmp/{STARTAPP_TOKEN}", 200, 12.4)
     assert STARTAPP_TOKEN in result
     assert "<token>" not in result
     assert result == f"200 GET /api/cmp/{STARTAPP_TOKEN} — 12 мс"
 
-
-def test_describe_webapp_request_keeps_start_param_visible() -> None:
     token = "337326_AbCdEfGhIjKlMnOpQrSt"
     result = describe_webapp_request(
         "GET", f"/app/cmp?tgWebAppStartParam={token}", 200, 1.4
     )
     assert result == f"200 GET /app/cmp?tgWebAppStartParam={token} — 1 мс"
 
+    path = "/api/cmp/" + "a" * 200
+    result = describe_webapp_request("GET", path, 200, 1.4)
+    assert path in result
+    assert "…" not in result
 
-def test_describe_webapp_request_hides_init_data_only() -> None:
+    result = describe_webapp_request(
+        "GET", f"/api/cmp/{STARTAPP_TOKEN}", 200, 1.4, user_id=42
+    )
+    assert result == f"200 GET /api/cmp/{STARTAPP_TOKEN} — 1 мс user=42"
+    assert result.endswith(" user=42")
+
+    result = describe_webapp_request("POST", "/api/cmp/log", 204, 0.2)
+    assert result == "204 POST /api/cmp/log — 0 мс"
+    assert "user=" not in result
+
+    result = describe_webapp_request("GET", "/api/cmp/<token>", 200, 12.4, user_id=42)
+    assert "/api/cmp/<token>" in result
+
+    for method, path, status, ms in (
+        (None, None, None, None),
+        (42, object(), 200, -5.0),
+        ("get", 12345, "200", "1.4"),
+    ):
+        result = describe_webapp_request(method, path, status, ms)
+        assert isinstance(result, str)
+        assert "\n" not in result
+
+
+def test_describe_webapp_request_hides_user_data_only() -> None:
+    """`init_data`/`tgWebAppData` скрыты, а `tgWebAppStartParam` намеренно виден."""
     token = "337326_AbCdEfGhIjKlMnOpQrSt"
     result = describe_webapp_request(
         "GET",
@@ -253,8 +231,6 @@ def test_describe_webapp_request_hides_init_data_only() -> None:
     assert "&v=2" in result
     assert result.endswith("— 1 мс")
 
-
-def test_describe_webapp_request_hides_webapp_data_param() -> None:
     result = describe_webapp_request(
         "GET", "/app/cmp?tgWebAppData=query_id%3D1&tgWebAppVersion=7", 200, 1.4
     )
@@ -262,42 +238,14 @@ def test_describe_webapp_request_hides_webapp_data_param() -> None:
     assert "query_id" not in result
     assert "tgWebAppVersion=7" in result
 
-
-def test_describe_webapp_request_does_not_truncate_url() -> None:
-    path = "/api/cmp/" + "a" * 200
-    result = describe_webapp_request("GET", path, 200, 1.4)
-    assert path in result
-    assert "…" not in result
-
-
-def test_describe_webapp_request_adds_user_suffix() -> None:
-    result = describe_webapp_request(
-        "GET", f"/api/cmp/{STARTAPP_TOKEN}", 200, 1.4, user_id=42
-    )
-    assert result == f"200 GET /api/cmp/{STARTAPP_TOKEN} — 1 мс user=42"
-    assert result.endswith(" user=42")
-
-
-def test_describe_webapp_request_without_user() -> None:
-    result = describe_webapp_request("POST", "/api/cmp/log", 204, 0.2)
-    assert result == "204 POST /api/cmp/log — 0 мс"
-    assert "user=" not in result
-
-
-def test_describe_webapp_request_keeps_placeholder_path() -> None:
-    result = describe_webapp_request("GET", "/api/cmp/<token>", 200, 12.4, user_id=42)
-    assert "/api/cmp/<token>" in result
-
-
-def test_describe_webapp_request_never_raises() -> None:
-    for method, path, status, ms in (
-        (None, None, None, None),
-        (42, object(), 200, -5.0),
-        ("get", 12345, "200", "1.4"),
-    ):
-        result = describe_webapp_request(method, path, status, ms)
-        assert isinstance(result, str)
-        assert "\n" not in result
+    # Тот же параметр в `redact_url` маскируется, но в строке запроса остаётся.
+    url = f"/app/cmp?tgWebAppStartParam={token}"
+    assert redact_url(url) == "/app/cmp?tgWebAppStartParam=<redacted>"
+    assert token not in redact_url(url)
+    line = describe_webapp_request("GET", url, 200, 1)
+    assert line == f"200 GET /app/cmp?tgWebAppStartParam={token} — 1 мс"
+    assert token in line
+    assert "<redacted>" not in line
 
 
 def test_redact_request_url_hides_only_user_data() -> None:
@@ -311,8 +259,6 @@ def test_redact_request_url_hides_only_user_data() -> None:
     assert f"tgWebAppStartParam={token}" in result
     assert "user%3D1" not in result
 
-
-def test_redact_request_url_never_raises() -> None:
     for value in (None, "", "/", "?", "/%%%", 42, object()):
         assert isinstance(redact_request_url(value), str)
 
@@ -331,7 +277,8 @@ def test_describe_update_text_is_one_line() -> None:
     assert "\n" not in result
 
 
-def test_describe_update_photo_album_compact_hides_details() -> None:
+def test_describe_update_media_compact_and_verbose() -> None:
+    """Компактный лог скрывает `file_id`/размеры, verbose — показывает их."""
     photo = PhotoSize(
         file_id="file-photo",
         file_unique_id="unique-photo",
@@ -339,40 +286,26 @@ def test_describe_update_photo_album_compact_hides_details() -> None:
         height=80,
         file_size=12345,
     )
-    message = make_message(
+    photo_message = make_message(
         photo=[photo], caption="До / После", media_group_id="album-1"
     )
-    result = describe_update(make_update(message))
-    assert "media=photo" in result
-    assert "caption='До / После'" in result
-    assert "file_id" not in result
-    assert "size=" not in result
-    assert "bytes=" not in result
-    assert "media_group_id" not in result
-    assert "\n" not in result
+    compact = describe_update(make_update(photo_message))
+    assert "media=photo" in compact
+    assert "caption='До / После'" in compact
+    assert "file_id" not in compact
+    assert "size=" not in compact
+    assert "bytes=" not in compact
+    assert "media_group_id" not in compact
+    assert "\n" not in compact
 
+    verbose = describe_update(make_update(photo_message), verbose=True)
+    assert "media=photo" in verbose
+    assert "file_id=file-photo" in verbose
+    assert "size=100x80" in verbose
+    assert "bytes=12345" in verbose
+    assert "caption='До / После'" in verbose
+    assert "media_group_id=album-1" in verbose
 
-def test_describe_update_photo_album_verbose_has_details() -> None:
-    photo = PhotoSize(
-        file_id="file-photo",
-        file_unique_id="unique-photo",
-        width=100,
-        height=80,
-        file_size=12345,
-    )
-    message = make_message(
-        photo=[photo], caption="До / После", media_group_id="album-1"
-    )
-    result = describe_update(make_update(message), verbose=True)
-    assert "media=photo" in result
-    assert "file_id=file-photo" in result
-    assert "size=100x80" in result
-    assert "bytes=12345" in result
-    assert "caption='До / После'" in result
-    assert "media_group_id=album-1" in result
-
-
-def test_describe_update_document_compact_and_verbose() -> None:
     document = Document(
         file_id="file-doc",
         file_unique_id="unique-doc",
@@ -380,15 +313,14 @@ def test_describe_update_document_compact_and_verbose() -> None:
         mime_type="image/png",
         file_size=2048,
     )
-    message = make_update(make_message(document=document))
-
-    compact = describe_update(message)
+    update = make_update(make_message(document=document))
+    compact = describe_update(update)
     assert "media=document" in compact
     assert "name='before.png'" in compact
     assert "file_id" not in compact
     assert "bytes=" not in compact
 
-    verbose = describe_update(message, verbose=True)
+    verbose = describe_update(update, verbose=True)
     assert "media=document" in verbose
     assert "file_id=file-doc" in verbose
     assert "name='before.png'" in verbose
@@ -416,7 +348,7 @@ def test_describe_update_never_raises() -> None:
 # --------------------------------------------------------------------- Bot API
 
 
-def test_describe_api_call_hides_html_and_truncates() -> None:
+def test_describe_api_call_hides_html_and_counts() -> None:
     html = "<html>" + "x" * 5000
     result = describe_api_call(
         "sendWidget",
@@ -434,20 +366,15 @@ def test_describe_api_call_hides_html_and_truncates() -> None:
     assert "x" * 50 not in result
     assert settings.telegram_bot_token not in result
 
-
-def test_describe_api_call_counts_results() -> None:
     result = describe_api_call(
         "answerInlineQuery",
         {"inline_query_id": "q-1", "results": [{"type": "article"}] * 3},
     )
     assert "results=3" in result
-
-
-def test_describe_api_call_is_one_line() -> None:
     assert "\n" not in describe_api_call("getMe", {})
 
 
-def test_describe_api_response_ok() -> None:
+def test_describe_api_response_ok_error_and_not_json() -> None:
     result = describe_api_response(
         "sendWidget", 200, {"ok": True, "result": {"message_id": 42, "widget_id": "w1"}}
     )
@@ -457,16 +384,12 @@ def test_describe_api_response_ok() -> None:
     assert "message_id=42" in result
     assert "widget_id=w1" in result
 
-
-def test_describe_api_response_ok_with_list_result() -> None:
     result = describe_api_response(
         "answerInlineQuery", 200, {"ok": True, "result": ["a", "b"]}
     )
     assert "ok" in result
     assert "results=2" in result
 
-
-def test_describe_api_response_error() -> None:
     result = describe_api_response(
         "sendWidget",
         400,
@@ -477,8 +400,6 @@ def test_describe_api_response_error() -> None:
     assert "error_code=400" in result
     assert "Bad Request: chat not found" in result
 
-
-def test_describe_api_response_not_json() -> None:
     result = describe_api_response("getMe", 502, None)
     assert "err" in result
     assert "http=502" in result

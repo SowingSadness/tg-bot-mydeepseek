@@ -18,11 +18,13 @@
   ``Accept: image/avif`` (с фолбэком на WebP), ``Vary: Accept``,
   ``Cache-Control: immutable`` и ``ETag``; ``If-None-Match`` → 304 без тела;
 * ``POST /api/cmp/log`` → 204, если клиентский отчёт об ошибке принят; 403 при
-  битом/отсутствующем токене, 400 для пустого/не-JSON ``message``, 413 для
-  сообщения длиннее 500 символов или тела больше 8 КБ; не больше 30 отчётов
-  в минуту на токен (лишние отбрасываются с тем же 204 и одной `WARNING`-строкой
-  в логе); ``message`` и ``where`` схлопываются в одну строку и проходят
-  ``redact()``;
+  битом/отсутствующем токене (кроме сигнала «нет токена»: ``where="token"`` и
+  ``message="нет токена"`` принимаются без токена, дают одну фиксированную
+  ``WARNING``-строку и лимит 5/мин на IP клиента), 400 для пустого/не-JSON
+  ``message``, 413 для сообщения длиннее 500 символов или тела больше 8 КБ; не
+  больше 30 отчётов в минуту на токен (лишние отбрасываются с тем же 204 и одной
+  `WARNING`-строкой в логе); ``message`` и ``where`` схлопываются в одну строку и
+  проходят ``redact()``;
 * каждый запрос даёт ровно одну строку лога `<status> <METHOD> <url> — <N> мс`
   (`INFO` < 400, `WARNING` 4xx, `ERROR` 5xx), а `POST /api/cmp/log` — всегда
   `ERROR`, даже при `204`, плюс `cmp=`/`user=`, когда известны; токен
@@ -77,6 +79,14 @@ CLIENT_LOG_PATH = "/api/cmp/log"
 CLIENT_LOG_LIMIT = 30
 #: Окно лимита в секундах.
 CLIENT_LOG_WINDOW = 60.0
+#: Точный текст единственного отчёта, который принимается без токена.
+TOKENLESS_MESSAGE = "нет токена"
+#: `where` этого отчёта: другого места без токена сервер не принимает.
+TOKENLESS_WHERE = "token"
+#: Лимит отчётов без токена в минуту на один IP-адрес клиента.
+TOKENLESS_LIMIT = 5
+#: Готовая строка лога для отчёта без токена: клиентский текст не подставляется.
+TOKENLESS_LINE = "webapp[client] cmp=- where=token message=нет токена"
 #: Допустимые уровни клиентского отчёта; всё остальное — `error`.
 CLIENT_LOG_LEVELS = {
     "error": logging.ERROR,
@@ -101,6 +111,18 @@ def _now() -> float:
 def _client_text(value: str, limit: int) -> str:
     """Клиентский текст для лога: без токенов, переводов строк и лишних пробелов."""
     return _one_line(redact(_TOKEN_LIKE_RE.sub("<token>", value)), limit=limit)
+
+
+def _tokenless_beacon(data: dict) -> bool:
+    """Ровно ли это сигнал «нет токена», который принимается без токена.
+
+    Сравниваются исходные значения из тела: ни уровень, ни `where`, ни текст
+    клиента в строку лога не попадают.
+    """
+    return (
+        data.get("where") == TOKENLESS_WHERE
+        and data.get("message") == TOKENLESS_MESSAGE
+    )
 
 
 def _error(status: int, message: str) -> web.Response:
@@ -238,16 +260,35 @@ def build_webapp_app(
     приложения свой словарь `{sha256(token): [monotonic timestamps]}`.
     """
     client_logs: dict[str, list[float]] = {}
+    #: Отчёты без токена лимитируются по IP: `{remote: [monotonic timestamps]}`.
+    tokenless_logs: dict[str, list[float]] = {}
 
-    def _prune_client_logs(now: float) -> None:
+    def _prune_logs(limits: dict[str, list[float]], now: float) -> None:
         """Удаляет ключи лимита, чей последний отчёт старше окна."""
         stale = [
             key
-            for key, stamps in client_logs.items()
+            for key, stamps in limits.items()
             if not stamps or now - stamps[-1] >= CLIENT_LOG_WINDOW
         ]
         for key in stale:
-            client_logs.pop(key, None)
+            limits.pop(key, None)
+
+    def _tokenless_allowed(remote: str | None) -> bool:
+        """Лимит `TOKENLESS_LIMIT` отчётов в минуту на IP; сверх — молча `False`."""
+        key = remote or "-"
+        now = _now()
+        _prune_logs(tokenless_logs, now)
+        recent = [
+            stamp
+            for stamp in tokenless_logs.get(key, ())
+            if now - stamp < CLIENT_LOG_WINDOW
+        ]
+        if len(recent) >= TOKENLESS_LIMIT:
+            tokenless_logs[key] = recent
+            return False
+        recent.append(now)
+        tokenless_logs[key] = recent
+        return True
 
     async def healthz(request: web.Request) -> web.Response:
         """Живость сервера: без БД, диска и авторизации."""
@@ -337,9 +378,10 @@ def build_webapp_app(
         """Клиентский отчёт об ошибке из самой страницы мини-аппа.
 
         Токен обязателен и проверяется подписью: без него в лог не пишется
-        ничего. `url` (страница, где случилась ошибка) намеренно не логируем.
-        Лимит — 30 отчётов в минуту на токен, сверх — `204` клиенту и одна
-        `WARNING`-строка о том, что отчёт отброшен (тело отчёта не пишется).
+        ничего, кроме узкого сигнала «нет токена» (`where="token"` и точный
+        текст). `url` (страница, где случилась ошибка) намеренно не логируем.
+        Лимит — 30 отчётов в минуту на токен (сигнал без токена — 5 в минуту на
+        IP), сверх — `204` клиенту и одна `WARNING`-строка для отчётов с токеном.
         """
         try:
             data = await request.json()
@@ -353,6 +395,13 @@ def build_webapp_app(
         raw_token = data.get("token")
         cmp_id = webauth.verify(raw_token) if isinstance(raw_token, str) else None
         if cmp_id is None:
+            # Узкое исключение из контракта «без токена — 403 и тишина»: страница
+            # без токена может сообщить только «нет токена». Строка фиксированная,
+            # клиентский текст в неё не подставляется.
+            if _tokenless_beacon(data):
+                if _tokenless_allowed(request.remote):
+                    log.warning("%s", TOKENLESS_LINE)
+                return web.Response(status=204)
             return _error(403, "Ссылка недействительна")
         # Для middleware: `cmp=<id>` в строке запроса и в отчёте.
         request["webapp_cmp_id"] = cmp_id
@@ -377,7 +426,7 @@ def build_webapp_app(
         now = _now()
         # Каждый вызов подчищает ключи, у которых последний отчёт уже вне окна:
         # иначе словарь лимита растёт вместе с числом разных токенов.
-        _prune_client_logs(now)
+        _prune_logs(client_logs, now)
         recent = [
             stamp
             for stamp in client_logs.get(key, ())

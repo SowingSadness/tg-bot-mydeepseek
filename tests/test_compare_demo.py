@@ -114,17 +114,14 @@ def test_index_has_mock_iframe_theme_and_slider(page_dir: Path) -> None:
 # ------------------------------------------------------------------- высота / AR
 
 
-@pytest.mark.parametrize(
-    ("width", "height"),
-    [(200, 133), (320, 213), (430, 287), (600, 400)],
-)
-def test_iframe_height_follows_aspect(built, width: int, height: int) -> None:
-    page = demo.index_html(built, width=width)
-    assert demo.aspect_ratio(built.aspect) == pytest.approx(3 / 2)
-    assert f'height="{height}"' in page
-    assert f"height:{height}px" in page
-    # JS пересчитывает ту же формулу при смене ширины.
-    assert "Math.round(width / AR)" in page
+def test_iframe_height_follows_aspect(built) -> None:
+    for width, height in [(200, 133), (320, 213), (430, 287), (600, 400)]:
+        page = demo.index_html(built, width=width)
+        assert demo.aspect_ratio(built.aspect) == pytest.approx(3 / 2)
+        assert f'height="{height}"' in page, width
+        assert f"height:{height}px" in page, width
+        # JS пересчитывает ту же формулу при смене ширины.
+        assert "Math.round(width / AR)" in page
 
 
 def test_serve_mode_uses_widget_url(built) -> None:
@@ -150,6 +147,25 @@ def test_srcdoc_escapes_mock_and_widget(page_dir: Path, built) -> None:
     # Раскодированный srcdoc — это ровно мок + виджет (ничего не потеряно).
     assert html_module.unescape(value) == demo.with_mock(built.html)
 
+    # Враждебные символы в бабле не рвут ни `srcdoc`, ни JS-строку.
+    weird = '<script>alert("x")</script><img src="x">&'
+    dangerous = build_module.Built(
+        html=weird,
+        width=430,
+        quality=34,
+        zlib_bytes=1,
+        html_bytes=len(weird),
+        picture_bytes=1,
+        image_a=b"",
+        image_b=b"",
+    )
+    page = demo.index_html(dangerous, width=430)
+    value = _srcdoc(page)
+    assert "</script>" not in value
+    assert '"' not in value
+    assert html_module.unescape(value) == demo.with_mock(weird)
+    assert demo._js_string("</script>") == '"<\\/script>"'
+
 
 def test_mock_goes_before_widget() -> None:
     served = demo.with_mock("<p>widget</p>")
@@ -168,27 +184,6 @@ def test_mock_goes_before_widget() -> None:
         "onEvent:",
     ):
         assert member in served
-
-
-def test_escaping_survives_dangerous_widget_html() -> None:
-    """Враждебные символы в бабле не рвут ни `srcdoc`, ни JS-строку."""
-    weird = '<script>alert("x")</script><img src="x">&'
-    built = build_module.Built(
-        html=weird,
-        width=430,
-        quality=34,
-        zlib_bytes=1,
-        html_bytes=len(weird),
-        picture_bytes=1,
-        image_a=b"",
-        image_b=b"",
-    )
-    page = demo.index_html(built, width=430)
-    value = _srcdoc(page)
-    assert "</script>" not in value
-    assert '"' not in value
-    assert html_module.unescape(value) == demo.with_mock(weird)
-    assert demo._js_string("</script>") == '"<\\/script>"'
 
 
 # ------------------------------------------------------------------ CLI-опции
@@ -279,10 +274,17 @@ class _FakeServer:
         self.closed = True
 
 
-def test_serve_prints_url_and_stops(monkeypatch, capsys, tmp_path: Path) -> None:
+def test_serve_prints_url_stops_and_handles_ports(monkeypatch, capsys, tmp_path: Path) -> None:
     fake = _FakeServer()
-    monkeypatch.setattr(demo, "bind_server", lambda directory: fake)
     opened: list[str] = []
+    used: list[int] = []
+
+    def factory(directory, port=0):  # noqa: ANN001, ANN202
+        used.append(port)
+        return fake
+
+    monkeypatch.setattr(demo, "make_server", factory)
+    monkeypatch.setattr(demo, "bind_server", lambda directory: fake)
     monkeypatch.setattr(demo.webbrowser, "open", opened.append)
 
     assert demo._serve(tmp_path, port=None, open_browser=True) == 0
@@ -292,16 +294,6 @@ def test_serve_prints_url_and_stops(monkeypatch, capsys, tmp_path: Path) -> None
     assert fake.closed
     assert opened == ["http://127.0.0.1:8765/"]
 
-
-def test_serve_explicit_port_and_busy_port(monkeypatch, tmp_path: Path) -> None:
-    fake = _FakeServer()
-    used: list[int] = []
-
-    def factory(directory, port=0):  # noqa: ANN001, ANN202
-        used.append(port)
-        return fake
-
-    monkeypatch.setattr(demo, "make_server", factory)
     assert demo._serve(tmp_path, port=9000, open_browser=False) == 0
     assert used == [9000]
 
@@ -315,7 +307,7 @@ def test_serve_explicit_port_and_busy_port(monkeypatch, tmp_path: Path) -> None:
 # --------------------------------------------------------------------- хелперы
 
 
-def test_aspect_ratio_and_labels_helpers() -> None:
+def test_aspect_ratio_labels_clamp_and_caption(built) -> None:
     assert demo.aspect_ratio("3:2") == pytest.approx(1.5)
     assert demo.aspect_ratio("4:3") == pytest.approx(4 / 3)
     assert demo.aspect_ratio("мусор") == pytest.approx(1.5)
@@ -326,8 +318,6 @@ def test_aspect_ratio_and_labels_helpers() -> None:
     assert demo.parse_labels("без разделителя") == demo.LABELS
     assert demo.parse_labels(None) == demo.LABELS
 
-
-def test_clamp_width_and_caption(built) -> None:
     assert demo.clamp_width(320) == 320
     assert demo.clamp_width(100) == demo.MIN_WIDTH
     assert demo.clamp_width(900) == demo.MAX_WIDTH

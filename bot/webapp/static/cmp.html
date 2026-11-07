@@ -175,15 +175,19 @@ var resizeTimer = 0;
 // --------------------------------------------------------- отчёт об ошибках
 // В WebView Telegram консоль не видна, поэтому ошибки страницы уходят на сервер
 // (`POST /api/cmp/log`, JSON) и попадают в общий лог бота. Одна ошибка — один
-// отчёт (дедупликация), без токена не отправляем ничего, наружу не бросаем.
+// отчёт (дедупликация). Без токена сервер принимает только сигнал «нет токена»
+// (`where='token'`), поэтому остальные отчёты без токена не отправляем; наружу
+// не бросаем ничего.
 var reported = new Set();
 
 function report(level, message, where) {
   try {
-    var token = startToken();
-    if (!token) return;
     var text = String(message === undefined || message === null ? 'unknown' : message).slice(0, 500);
     var place = String(where || '').slice(0, 100);
+    var token = startToken();
+    // Единственное исключение из «без токена не отправляем»: сигнал «нет токена».
+    // Сервер принимает его без токена только при `where='token'` (узкий контракт).
+    if (!token && place !== 'token') return;
     var key = level + '|' + place + '|' + text;
     if (reported.has(key)) return;
     reported.add(key);
@@ -268,18 +272,29 @@ function hideScreen() {
 
 // ------------------------------------------------------------ токен и данные
 
-// Для локальной отладки без Telegram — ?t=<token> в адресе страницы.
-function startToken() {
+// Значение query-параметра страницы; пустая строка, если параметра нет или
+// `window.location`/`URLSearchParams` недоступны (исключения не выходят наружу).
+function queryParam(name) {
   try {
-    var param = tg && tg.initDataUnsafe && tg.initDataUnsafe.start_param;
-    if (param) return String(param).trim();
-  } catch (err) { /* нет Telegram — пробуем query */ }
-  try {
-    var query = new URLSearchParams(window.location.search);
-    return (query.get('t') || '').trim();
+    return (new URLSearchParams(window.location.search).get(name) || '').trim();
   } catch (err) {
     return '';
   }
+}
+
+// Номер сравнения: сначала `initDataUnsafe.start_param` из Telegram SDK, затем
+// query. Мобильный WebView присылает номер как `?tgWebAppStartParam=`, web-ссылки —
+// как `?startapp=`, `?t=` оставлен для локальной отладки без Telegram.
+function startToken() {
+  var param = '';
+  try {
+    param = tg && tg.initDataUnsafe && tg.initDataUnsafe.start_param;
+  } catch (err) { param = ''; /* нет Telegram — пробуем query */ }
+  if (param) {
+    param = String(param).trim();
+    if (param) return param;
+  }
+  return queryParam('tgWebAppStartParam') || queryParam('startapp') || queryParam('t');
 }
 
 function telegramInitData() {
@@ -359,6 +374,7 @@ function load() {
 
   var token = startToken();
   if (!token) {
+    report('warning', 'нет токена', 'token');
     showScreen(
       '',
       'Откройте сравнение из чата',
